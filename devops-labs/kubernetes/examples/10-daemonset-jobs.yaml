@@ -1,0 +1,194 @@
+# Example 10: DaemonSets, Jobs, and CronJobs
+# DaemonSet: one pod per node. Job: run to completion. CronJob: scheduled.
+
+---
+# DaemonSet — log collector on every node
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: logging
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1              # Update one node at a time
+
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccountName: fluentd-sa
+      tolerations:
+      # Run on control-plane nodes too
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      # Run on nodes with any taint
+      - operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30        # Stay for 30s after node is tainted
+
+      containers:
+      - name: fluentd
+        image: fluent/fluentd-kubernetes-daemonset:v1.16-debian-elasticsearch8-1
+        env:
+        - name: FLUENT_ELASTICSEARCH_HOST
+          value: "elasticsearch.logging.svc.cluster.local"
+        - name: FLUENT_ELASTICSEARCH_PORT
+          value: "9200"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "200Mi"
+          limits:
+            cpu: "500m"
+            memory: "500Mi"
+
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: fluentd-config
+          mountPath: /fluentd/etc
+
+      terminationGracePeriodSeconds: 30
+
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: fluentd-config
+        configMap:
+          name: fluentd-config
+
+---
+# DaemonSet — security agent (only on labeled nodes)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: security
+spec:
+  selector:
+    matchLabels:
+      app: falco
+  template:
+    metadata:
+      labels:
+        app: falco
+    spec:
+      nodeSelector:
+        security-scanning: "enabled"   # Only run on selected nodes
+      hostPID: true                    # Needs host PID namespace for syscall monitoring
+      hostNetwork: true
+      containers:
+      - name: falco
+        image: falcosecurity/falco:0.37.0
+        securityContext:
+          privileged: true             # Needs privileged for kernel module
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+
+---
+# Job — database migration (run once, on deploy)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate-v2-1-0
+  namespace: production
+  annotations:
+    helm.sh/hook: pre-upgrade         # Run before Helm upgrade
+    helm.sh/hook-delete-policy: hook-succeeded
+spec:
+  backoffLimit: 3                    # Retry 3 times on failure
+  activeDeadlineSeconds: 600         # Fail if not done in 10 minutes
+  ttlSecondsAfterFinished: 3600      # Auto-delete 1 hour after completion
+
+  template:
+    spec:
+      restartPolicy: OnFailure        # Jobs must use OnFailure or Never (not Always)
+      containers:
+      - name: migrate
+        image: myapp:v2.1.0
+        command: ["python", "manage.py", "migrate", "--noinput"]
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-service-secrets
+              key: database-url
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+---
+# CronJob — nightly database backup
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: database
+spec:
+  schedule: "0 2 * * *"             # 2 AM UTC every day
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid          # Don't start new job if previous still running
+  successfulJobsHistoryLimit: 3      # Keep last 3 successful jobs
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300       # If missed schedule, run within 5 min or skip
+
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: postgres:15-alpine
+            command:
+            - /bin/sh
+            - -c
+            - |
+              BACKUP_FILE="backup-$(date +%Y%m%d-%H%M%S).sql.gz"
+              pg_dump $DATABASE_URL | gzip > /tmp/$BACKUP_FILE
+              aws s3 cp /tmp/$BACKUP_FILE s3://my-db-backups/postgres/$BACKUP_FILE
+              echo "Backup complete: $BACKUP_FILE"
+            env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secrets
+                  key: backup-url
+            - name: AWS_REGION
+              value: us-east-1
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "256Mi"

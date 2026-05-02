@@ -1,0 +1,155 @@
+# Example 09: Resource Management — Quotas, LimitRanges, Priority Classes
+# Prevent runaway workloads. Guarantee SLA for critical apps.
+
+---
+# ResourceQuota — cap total resources per namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: production-quota
+  namespace: production
+spec:
+  hard:
+    # Compute resources
+    requests.cpu: "50"               # Total CPU requests across all pods
+    requests.memory: "100Gi"
+    limits.cpu: "100"
+    limits.memory: "200Gi"
+
+    # Object count limits
+    pods: "200"
+    services: "50"
+    services.loadbalancers: "5"      # LoadBalancer services cost money
+    services.nodeports: "0"          # Block NodePort in production
+    persistentvolumeclaims: "50"
+    secrets: "100"
+    configmaps: "100"
+
+    # Storage
+    requests.storage: "2Ti"
+    fast-ssd.storageclass.storage.k8s.io/requests.storage: "1Ti"
+
+---
+# LimitRange — default + min/max per container
+# Without this, pods with no resources set get Guaranteed QoS of 0 → evicted first
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: production-limits
+  namespace: production
+spec:
+  limits:
+  # Container defaults (applied when container has no resources set)
+  - type: Container
+    default:
+      cpu: "500m"
+      memory: "512Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+    max:
+      cpu: "8"
+      memory: "16Gi"
+    min:
+      cpu: "50m"
+      memory: "64Mi"
+
+  # Pod-level max (sum of all containers in pod)
+  - type: Pod
+    max:
+      cpu: "16"
+      memory: "32Gi"
+
+  # PVC storage limits
+  - type: PersistentVolumeClaim
+    max:
+      storage: "500Gi"
+    min:
+      storage: "1Gi"
+
+---
+# PriorityClass — critical apps get scheduled first, evicted last
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: critical-priority
+value: 1000000
+globalDefault: false
+description: "Critical production services — evicted last"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 100000
+globalDefault: false
+description: "Important production services"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: default-priority
+value: 0
+globalDefault: true
+description: "Default for all pods"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch-priority
+value: -100
+globalDefault: false
+preemptionPolicy: Never              # Cannot preempt other pods
+description: "Batch/background jobs — low priority"
+
+---
+# Apply PriorityClass to a Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      priorityClassName: critical-priority   # Highest eviction protection
+      containers:
+      - name: app
+        image: payment-service:latest
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+
+---
+# Batch job with low priority (gets preempted if cluster is under pressure)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nightly-report
+  namespace: production
+spec:
+  template:
+    spec:
+      priorityClassName: batch-priority
+      containers:
+      - name: reporter
+        image: reporter:latest
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+      restartPolicy: OnFailure

@@ -1,0 +1,186 @@
+# Example 02: Deployments — Production Patterns
+# Covers: rolling updates, rollback, canary, blue/green selectors
+
+---
+# Production-grade Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+  labels:
+    app: api-service
+    version: v2.1.0
+  annotations:
+    deployment.kubernetes.io/revision: "5"
+    change-cause: "Upgrade to v2.1.0 — adds payment retry logic"  # kubectl rollout history shows this
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: api-service
+
+  # Rolling update strategy — zero downtime
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # Allow 1 extra pod during update (4 total max)
+      maxUnavailable: 0    # Never go below 3 healthy pods (zero downtime)
+
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: v2.1.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+
+    spec:
+      # Spread pods across availability zones
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api-service
+
+      # Don't schedule 2 replicas on the same node
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["api-service"]
+            topologyKey: kubernetes.io/hostname
+
+      serviceAccountName: api-service-sa  # Always use dedicated SA, not default
+
+      # Security: drop all capabilities, run as non-root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+      - name: api
+        image: myregistry.io/api-service:v2.1.0
+        imagePullPolicy: IfNotPresent   # Never pull same tag twice in prod
+
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: metrics
+          containerPort: 9090
+
+        # Read config from ConfigMap
+        envFrom:
+        - configMapRef:
+            name: api-service-config
+        # Add secrets on top
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-service-secrets
+              key: database-url
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-service-secrets
+              key: jwt-secret
+
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+
+        # Container-level security
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true    # Immutable filesystem
+          capabilities:
+            drop: ["ALL"]
+
+        # Mounts for read-only filesystem workaround
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]  # Allow in-flight requests to finish
+
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir: {}
+
+      terminationGracePeriodSeconds: 30   # 30s to finish in-flight requests
+
+      # Pull images from private registry
+      imagePullSecrets:
+      - name: registry-credentials
+
+---
+# PodDisruptionBudget — protects availability during node maintenance/upgrades
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-service-pdb
+  namespace: production
+spec:
+  minAvailable: 2          # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: api-service
+
+---
+# Rollout commands reference (run these after applying):
+#
+# Check rollout status:
+#   kubectl rollout status deployment/api-service -n production
+#
+# View history:
+#   kubectl rollout history deployment/api-service -n production
+#
+# Rollback to previous version:
+#   kubectl rollout undo deployment/api-service -n production
+#
+# Rollback to specific revision:
+#   kubectl rollout undo deployment/api-service --to-revision=3 -n production
+#
+# Pause rollout (for canary validation):
+#   kubectl rollout pause deployment/api-service -n production
+#
+# Resume rollout:
+#   kubectl rollout resume deployment/api-service -n production

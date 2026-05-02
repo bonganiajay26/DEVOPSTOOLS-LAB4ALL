@@ -1,0 +1,158 @@
+# Example 01: Pod Basics
+# Run with: kubectl apply -f 01-pod-basics.yaml
+# Delete with: kubectl delete -f 01-pod-basics.yaml
+#
+# NOTE: In production, never run bare Pods — use Deployments.
+# This is for learning the object model only.
+
+---
+# Basic Pod — single container
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-basic
+  namespace: default
+  labels:
+    app: nginx
+    example: "01"
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25-alpine          # Always pin a version. Never use :latest in production.
+    ports:
+    - containerPort: 80
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
+
+---
+# Pod with environment variables
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-demo
+  labels:
+    app: env-demo
+spec:
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sh", "-c", "echo DB_HOST=$DB_HOST && sleep 3600"]
+    env:
+    - name: DB_HOST
+      value: "postgres.database.svc.cluster.local"
+    - name: APP_ENV
+      value: "production"
+    - name: POD_NAME                  # Inject pod metadata as env var
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+
+---
+# Pod with init container
+# Init containers run to completion before app containers start.
+# Use case: wait for DB, run migrations, fetch secrets
+apiVersion: v1
+kind: Pod
+metadata:
+  name: init-demo
+spec:
+  initContainers:
+  - name: wait-for-db                 # Block until postgres is up
+    image: busybox:1.36
+    command: ['sh', '-c',
+      'until nc -z postgres.database.svc.cluster.local 5432;
+       do echo "Waiting for postgres..."; sleep 2; done;
+       echo "Postgres is up!"']
+
+  - name: run-migrations              # Run DB migrations before app starts
+    image: myapp/migrator:latest
+    env:
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: db-credentials
+          key: url
+
+  containers:
+  - name: app
+    image: myapp:1.0
+    ports:
+    - containerPort: 8080
+
+---
+# Pod with sidecar (logging agent)
+# Sidecar pattern: helper container runs alongside main app
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sidecar-demo
+spec:
+  volumes:
+  - name: shared-logs
+    emptyDir: {}                      # Shared volume between containers
+
+  containers:
+  - name: app
+    image: nginx:1.25-alpine
+    volumeMounts:
+    - name: shared-logs
+      mountPath: /var/log/nginx
+
+  - name: log-shipper                 # Sidecar: reads logs, ships to Elasticsearch
+    image: fluent/fluentd:v1.16
+    volumeMounts:
+    - name: shared-logs
+      mountPath: /logs
+      readOnly: true
+
+---
+# Pod with liveness and readiness probes
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe-demo
+spec:
+  containers:
+  - name: app
+    image: myapp:1.0
+    ports:
+    - containerPort: 8080
+
+    # Startup probe: Give the app 5 minutes to start
+    startupProbe:
+      httpGet:
+        path: /healthz/startup
+        port: 8080
+      failureThreshold: 30           # 30 * 10s = 5 minutes max start time
+      periodSeconds: 10
+
+    # Readiness: Only send traffic when this passes
+    readinessProbe:
+      httpGet:
+        path: /healthz/ready
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 3            # 3 failures → remove from Service endpoints
+
+    # Liveness: Restart container if this fails
+    livenessProbe:
+      httpGet:
+        path: /healthz/live
+        port: 8080
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      failureThreshold: 3

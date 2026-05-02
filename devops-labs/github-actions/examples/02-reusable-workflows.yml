@@ -1,0 +1,88 @@
+# Reusable Workflow — call this from any repository
+# Path: .github/workflows/reusable-deploy.yml
+# Call with: uses: myorg/.github/.github/workflows/reusable-deploy.yml@main
+
+name: Reusable Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: "Target environment (staging|production)"
+      image-tag:
+        required: true
+        type: string
+      cluster-name:
+        required: true
+        type: string
+      namespace:
+        required: false
+        type: string
+        default: default
+      health-check-url:
+        required: false
+        type: string
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: us-east-1
+
+    - uses: azure/setup-kubectl@v4
+
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig \
+          --name ${{ inputs.cluster-name }} \
+          --region us-east-1
+
+    - name: Deploy
+      run: |
+        sed -i "s|IMAGE_TAG|${{ inputs.image-tag }}|g" k8s/deployment.yaml
+        kubectl apply -f k8s/ -n ${{ inputs.namespace }}
+        kubectl rollout status deployment --all \
+          -n ${{ inputs.namespace }} --timeout=10m
+
+    - name: Health check
+      if: inputs.health-check-url != ''
+      run: |
+        sleep 15
+        curl -sf ${{ inputs.health-check-url }}/health
+
+---
+# How to call the reusable workflow:
+# .github/workflows/deploy.yml (in any repo)
+
+# name: Deploy
+# on:
+#   push:
+#     branches: [main]
+# jobs:
+#   deploy-staging:
+#     uses: myorg/.github/.github/workflows/reusable-deploy.yml@main
+#     with:
+#       environment: staging
+#       image-tag: ${{ needs.build.outputs.image-tag }}
+#       cluster-name: my-cluster-staging
+#       namespace: staging
+#       health-check-url: https://staging.company.com
+#     secrets:
+#       AWS_ROLE_ARN: ${{ secrets.STAGING_AWS_ROLE }}
+#       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

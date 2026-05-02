@@ -1,0 +1,174 @@
+# Example 05: StatefulSets & Persistent Storage
+# Use case: PostgreSQL cluster with persistent data
+
+---
+# StorageClass — defines HOW storage is provisioned
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: ebs.csi.aws.com         # AWS EBS CSI driver
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+  kmsKeyId: "arn:aws:kms:us-east-1:123456789:key/abc-def"
+reclaimPolicy: Retain                # RETAIN data when PVC deleted (production safety)
+allowVolumeExpansion: true           # Allow resizing without downtime
+volumeBindingMode: WaitForFirstConsumer  # Provision in same AZ as pod
+
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: database
+spec:
+  serviceName: "postgres-headless"   # Must match headless service name
+  replicas: 1                        # Scale to 3 for HA with Patroni/pg_auto_failover
+
+  selector:
+    matchLabels:
+      app: postgres
+
+  # StatefulSets update pods one at a time in reverse order (pod-2, pod-1, pod-0)
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0                   # Set to 1 to only update pod-0 (canary)
+
+  template:
+    metadata:
+      labels:
+        app: postgres
+        version: "15"
+    spec:
+      terminationGracePeriodSeconds: 60   # Give postgres time for clean shutdown
+
+      securityContext:
+        fsGroup: 999                 # postgres group owns mounted volumes
+
+      initContainers:
+      - name: init-permissions
+        image: busybox:1.36
+        command: ['sh', '-c', 'chmod 700 /var/lib/postgresql/data']
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+
+        env:
+        - name: POSTGRES_DB
+          value: "appdb"
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: username
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+  # volumeClaimTemplates — creates a unique PVC per pod
+  # postgres-data-postgres-0, postgres-data-postgres-1, etc.
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]  # Only one pod can mount RW
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# Headless Service for StatefulSet (stable DNS per pod)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: database
+spec:
+  type: ClusterIP
+  clusterIP: None                    # Headless: no virtual IP
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  publishNotReadyAddresses: true     # Include not-ready pods in DNS (needed for cluster init)
+
+---
+# Regular Service for applications to connect
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: database
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+---
+# Standalone PersistentVolumeClaim (for non-StatefulSet workloads)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads-pvc
+  namespace: production
+spec:
+  accessModes:
+  - ReadWriteMany                    # Multiple pods can mount RW (requires NFS/EFS)
+  storageClassName: efs-sc           # AWS EFS StorageClass
+  resources:
+    requests:
+      storage: 50Gi

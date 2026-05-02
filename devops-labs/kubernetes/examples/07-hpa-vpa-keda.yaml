@@ -1,0 +1,178 @@
+# Example 07: Autoscaling — HPA, VPA, and KEDA
+# Scale on CPU, memory, custom metrics, and external event sources
+
+---
+# HPA v2 — scale on CPU + memory + custom metrics
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 3
+  maxReplicas: 50
+
+  metrics:
+  # CPU utilization
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60        # Scale out when avg CPU > 60%
+
+  # Memory utilization
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 75
+
+  # Custom metric from Prometheus (via Prometheus Adapter)
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "500"           # Scale out when avg RPS per pod > 500
+
+  # External metric (e.g. SQS queue depth)
+  - type: External
+    external:
+      metric:
+        name: sqs_queue_depth
+        selector:
+          matchLabels:
+            queue: order-processor
+      target:
+        type: AverageValue
+        averageValue: "100"           # Scale out when queue depth > 100 msgs per pod
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # Wait 60s before scaling up again
+      policies:
+      - type: Percent
+        value: 100                      # Double pods per minute max
+        periodSeconds: 60
+      - type: Pods
+        value: 5                        # Or add 5 pods per minute
+        periodSeconds: 60
+      selectPolicy: Max                 # Use whichever adds more pods
+
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Wait 5 min before scaling down (avoid flapping)
+      policies:
+      - type: Percent
+        value: 10                       # Remove max 10% of pods per minute
+        periodSeconds: 60
+
+---
+# VPA — Vertical Pod Autoscaler
+# Automatically adjusts resource requests based on actual usage
+# Install: kubectl apply -f https://github.com/kubernetes/autoscaler/releases/latest/download/vertical-pod-autoscaler.yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-service-vpa
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  updatePolicy:
+    updateMode: "Off"                 # Off = just recommend, don't change (use for analysis)
+    # "Auto" = auto-update (restarts pods) — use in dev/staging
+    # "Initial" = only set on new pods, don't restart existing
+
+  resourcePolicy:
+    containerPolicies:
+    - containerName: api
+      minAllowed:
+        cpu: "100m"
+        memory: "128Mi"
+      maxAllowed:
+        cpu: "4000m"
+        memory: "8Gi"
+      controlledResources: ["cpu", "memory"]
+
+# Check VPA recommendations:
+# kubectl describe vpa api-service-vpa -n production
+
+---
+# KEDA — Kubernetes Event-Driven Autoscaling
+# Scale to zero. Scale on ANY event source.
+# Install: helm repo add kedacore https://kedacore.github.io/charts
+#          helm install keda kedacore/keda --namespace keda --create-namespace
+
+# ScaledObject: Scale a Deployment based on SQS queue depth
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-processor-scaler
+  namespace: production
+spec:
+  scaleTargetRef:
+    name: order-processor             # Deployment to scale
+  pollingInterval: 15                 # Check every 15 seconds
+  cooldownPeriod: 300                 # Wait 5 min before scaling to zero
+  minReplicaCount: 0                  # Scale to zero when no messages (cost savings!)
+  maxReplicaCount: 100
+
+  triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueURL: https://sqs.us-east-1.amazonaws.com/123456789/order-queue
+      queueLength: "10"               # 1 pod per 10 messages
+      awsRegion: us-east-1
+    authenticationRef:
+      name: aws-keda-auth
+
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring:9090
+      metricName: order_processing_latency_p99
+      threshold: "5000"               # Scale out if p99 latency > 5 seconds
+      query: histogram_quantile(0.99, rate(order_duration_seconds_bucket[1m])) * 1000
+
+---
+# ScaledJob — for batch workloads, creates Jobs instead of scaling Deployment
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: image-processor-job
+  namespace: production
+spec:
+  jobTargetRef:
+    template:
+      spec:
+        containers:
+        - name: processor
+          image: myapp/image-processor:latest
+        restartPolicy: OnFailure
+  pollingInterval: 30
+  maxReplicaCount: 50
+  triggers:
+  - type: rabbitmq
+    metadata:
+      host: amqp://rabbitmq.default:5672/
+      queueName: image-processing
+      queueLength: "1"               # 1 Job per message
+
+---
+# TriggerAuthentication — store credentials for KEDA scalers
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: aws-keda-auth
+  namespace: production
+spec:
+  podIdentity:
+    provider: aws                    # Use IRSA — no credentials needed in the manifest

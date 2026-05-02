@@ -1,0 +1,260 @@
+# Complete CI/CD Pipeline — Test → Build → Security Scan → Deploy
+# Path: .github/workflows/cicd.yml
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ── 1. Lint & Format ─────────────────────────────────────────
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: pip
+
+    - run: pip install ruff black isort mypy
+    - run: ruff check .
+    - run: black --check .
+    - run: isort --check .
+
+  # ── 2. Unit Tests ────────────────────────────────────────────
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+      fail-fast: false              # Don't cancel other matrix jobs on failure
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: testdb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt -r requirements-dev.txt
+
+    - name: Run tests
+      env:
+        DATABASE_URL: postgresql://postgres:testpassword@localhost:5432/testdb
+        REDIS_URL: redis://localhost:6379/0
+      run: pytest tests/ -v --cov=src --cov-report=xml --cov-report=term
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@v4
+      if: matrix.python-version == '3.12'   # Upload once, not per matrix
+      with:
+        file: coverage.xml
+
+  # ── 3. Security Scan ─────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check for secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: ${{ github.event.repository.default_branch }}
+
+    - name: Dependency vulnerability scan
+      uses: pypa/gh-action-pip-audit@v1.0.8
+      with:
+        inputs: requirements.txt
+
+  # ── 4. Build & Push Image ────────────────────────────────────
+  build:
+    name: Build & Push Docker Image
+    needs: [lint, test, security]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: docker/setup-buildx-action@v3
+
+    - uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=sha,format=short
+          type=raw,value=latest
+
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: production
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        sbom: true                  # Generate SBOM
+        provenance: true            # Generate SLSA provenance
+
+    - name: Scan image for CVEs
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        format: sarif
+        output: trivy-results.sarif
+        exit-code: 1
+        severity: CRITICAL,HIGH
+
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: trivy-results.sarif
+
+  # ── 5. Deploy to Staging ─────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging-api.company.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure AWS credentials (OIDC — no long-lived keys!)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::123456789:role/github-actions-deploy
+        aws-region: us-east-1
+
+    - uses: azure/setup-kubectl@v4
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name my-cluster-staging --region us-east-1
+
+    - name: Deploy to staging
+      env:
+        IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+      run: |
+        sed -i "s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/deployment.yaml
+        kubectl apply -f k8s/ -n staging
+        kubectl rollout status deployment/myapp -n staging --timeout=5m
+
+    - name: Run smoke tests
+      run: |
+        sleep 10
+        curl -sf https://staging-api.company.com/health
+
+  # ── 6. Deploy to Production ─────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production              # Requires manual approval in GitHub UI
+      url: https://api.company.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::123456789:role/github-actions-deploy-prod
+        aws-region: us-east-1
+
+    - uses: azure/setup-kubectl@v4
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name my-cluster-production --region us-east-1
+
+    - name: Deploy to production
+      env:
+        IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+      run: |
+        sed -i "s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/deployment.yaml
+        kubectl apply -f k8s/ -n production
+        kubectl rollout status deployment/myapp -n production --timeout=10m
+
+    - name: Production smoke test
+      run: |
+        sleep 15
+        for i in 1 2 3; do
+          STATUS=$(curl -sf https://api.company.com/health | jq -r .status)
+          if [ "$STATUS" = "healthy" ]; then echo "Health check $i/3 passed"; fi
+          sleep 5
+        done
+
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        kubectl rollout undo deployment/myapp -n production
+        echo "DEPLOYMENT ROLLED BACK"
+
+    - name: Notify Slack
+      if: always()
+      uses: slackapi/slack-github-action@v1.26.0
+      with:
+        channel-id: "C0DEPLOYMENTS"
+        slack-message: |
+          ${{ job.status == 'success' && '✅' || '❌' }} Production deploy ${{ job.status }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+          Image: ${{ needs.build.outputs.image-tag }}
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

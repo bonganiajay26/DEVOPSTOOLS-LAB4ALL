@@ -1,0 +1,136 @@
+# Cloud Build Pipeline — Test → Build → Deploy to GKE
+# File: cloudbuild.yaml
+# Trigger: push to main branch
+
+steps:
+# ── Step 1: Run tests ─────────────────────────────────────────
+- name: python:3.12-slim
+  id: test
+  entrypoint: bash
+  args:
+  - -c
+  - |
+    pip install -r requirements.txt -r requirements-dev.txt
+    pytest tests/ -v --cov=src --cov-report=term
+
+# ── Step 2: Security scan ──────────────────────────────────────
+- name: aquasec/trivy
+  id: scan-dockerfile
+  args:
+  - config
+  - --exit-code
+  - "1"
+  - --severity
+  - "CRITICAL"
+  - .
+
+# ── Step 3: Build Docker image ─────────────────────────────────
+- name: gcr.io/cloud-builders/docker
+  id: build
+  args:
+  - build
+  - -t
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA}
+  - -t
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
+  - --target
+  - production
+  - --cache-from
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
+  - .
+
+# ── Step 4: Scan built image ───────────────────────────────────
+- name: aquasec/trivy
+  id: scan-image
+  args:
+  - image
+  - --exit-code
+  - "1"
+  - --severity
+  - "CRITICAL,HIGH"
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA}
+
+# ── Step 5: Push image ─────────────────────────────────────────
+- name: gcr.io/cloud-builders/docker
+  id: push
+  args:
+  - push
+  - --all-tags
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}
+
+# ── Step 6: Sign image (Supply Chain Security) ─────────────────
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  id: sign
+  entrypoint: gcloud
+  args:
+  - artifacts
+  - docker
+  - images
+  - add-tag
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA}
+  - --region=${_REGION}
+
+# ── Step 7: Deploy to GKE Staging ─────────────────────────────
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  id: deploy-staging
+  entrypoint: bash
+  args:
+  - -c
+  - |
+    gcloud container clusters get-credentials ${_CLUSTER} \
+      --region ${_REGION} --project ${PROJECT_ID}
+
+    # Update image in deployment
+    kubectl set image deployment/myapp \
+      app=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA} \
+      -n staging
+
+    kubectl rollout status deployment/myapp -n staging --timeout=5m
+
+# ── Step 8: Smoke test ─────────────────────────────────────────
+- name: curlimages/curl
+  id: smoke-test
+  args:
+  - -sf
+  - https://staging.myapp.company.com/health
+
+# ── Step 9: Deploy to Production (requires manual approval) ────
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  id: deploy-production
+  entrypoint: bash
+  args:
+  - -c
+  - |
+    gcloud container clusters get-credentials ${_PROD_CLUSTER} \
+      --region ${_REGION} --project ${PROJECT_ID}
+
+    kubectl set image deployment/myapp \
+      app=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA} \
+      -n production
+
+    kubectl rollout status deployment/myapp -n production --timeout=10m
+  waitFor: [smoke-test]
+
+# ── Artifacts & Logs ───────────────────────────────────────────
+images:
+- ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA}
+- ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8        # Faster builds
+  dynamic_substitutions: true
+
+substitutions:
+  _REGION: us-central1
+  _REPO: my-docker-repo
+  _IMAGE: myapp
+  _CLUSTER: my-gke-staging
+  _PROD_CLUSTER: my-gke-prod
+
+# Set up Cloud Build trigger:
+# gcloud beta builds triggers create github \
+#   --repo-name=myapp \
+#   --repo-owner=myorg \
+#   --branch-pattern="^main$" \
+#   --build-config=cloudbuild.yaml

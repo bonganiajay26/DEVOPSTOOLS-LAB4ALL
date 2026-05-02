@@ -1,0 +1,258 @@
+# Production Server Configuration Playbook
+# Hardens Ubuntu 22.04, installs Docker, configures monitoring agent
+
+---
+- name: Configure Production Web Servers
+  hosts: webservers
+  become: true                      # Escalate to root
+  gather_facts: true                # Collect system info into ansible_facts
+  vars:
+    docker_version: "24.0"
+    node_exporter_version: "1.7.0"
+    allowed_ssh_users: ["deploy", "ansible"]
+    fail2ban_maxretry: 3
+    ntp_servers:
+      - 169.254.169.123              # AWS NTP
+      - time.google.com
+
+  pre_tasks:
+  - name: Update apt cache
+    apt:
+      update_cache: yes
+      cache_valid_time: 3600        # Only update if older than 1 hour
+
+  tasks:
+  # ── System Hardening ─────────────────────────────────────────
+  - name: Set hostname
+    hostname:
+      name: "{{ inventory_hostname }}"
+
+  - name: Install security packages
+    apt:
+      name:
+        - fail2ban
+        - ufw
+        - unattended-upgrades
+        - auditd
+        - apparmor
+      state: present
+
+  - name: Configure UFW — deny all inbound by default
+    ufw:
+      state: enabled
+      policy: deny
+      direction: incoming
+
+  - name: Allow SSH
+    ufw:
+      rule: allow
+      port: "22"
+      proto: tcp
+      src: "{{ item }}"
+    loop: "{{ ssh_allowed_cidrs | default(['0.0.0.0/0']) }}"
+
+  - name: Allow HTTP/HTTPS
+    ufw:
+      rule: allow
+      port: "{{ item }}"
+      proto: tcp
+    loop: ["80", "443"]
+
+  - name: Configure SSH hardening
+    lineinfile:
+      path: /etc/ssh/sshd_config
+      regexp: "{{ item.regexp }}"
+      line: "{{ item.line }}"
+      validate: /usr/sbin/sshd -t -f %s
+    loop:
+      - { regexp: "^PermitRootLogin",    line: "PermitRootLogin no" }
+      - { regexp: "^PasswordAuthentication", line: "PasswordAuthentication no" }
+      - { regexp: "^X11Forwarding",      line: "X11Forwarding no" }
+      - { regexp: "^MaxAuthTries",       line: "MaxAuthTries 3" }
+      - { regexp: "^Protocol",           line: "Protocol 2" }
+    notify: Restart SSH
+
+  - name: Configure fail2ban
+    copy:
+      content: |
+        [sshd]
+        enabled = true
+        port = ssh
+        filter = sshd
+        logpath = /var/log/auth.log
+        maxretry = {{ fail2ban_maxretry }}
+        bantime = 3600
+        findtime = 600
+      dest: /etc/fail2ban/jail.local
+    notify: Restart fail2ban
+
+  # ── Docker Installation ───────────────────────────────────────
+  - name: Install Docker dependencies
+    apt:
+      name:
+        - ca-certificates
+        - curl
+        - gnupg
+      state: present
+
+  - name: Add Docker GPG key
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add Docker repository
+    apt_repository:
+      repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+      state: present
+
+  - name: Install Docker
+    apt:
+      name:
+        - "docker-ce={{ docker_version }}.*"
+        - docker-ce-cli
+        - containerd.io
+        - docker-buildx-plugin
+        - docker-compose-plugin
+      state: present
+
+  - name: Ensure Docker service is started and enabled
+    service:
+      name: docker
+      state: started
+      enabled: yes
+
+  - name: Add deploy user to docker group
+    user:
+      name: deploy
+      groups: docker
+      append: yes
+
+  - name: Configure Docker daemon
+    copy:
+      content: |
+        {
+          "log-driver": "json-file",
+          "log-opts": {
+            "max-size": "100m",
+            "max-file": "3"
+          },
+          "storage-driver": "overlay2",
+          "live-restore": true,
+          "default-ulimits": {
+            "nofile": { "Name": "nofile", "Hard": 65536, "Soft": 65536 }
+          }
+        }
+      dest: /etc/docker/daemon.json
+    notify: Restart Docker
+
+  # ── Prometheus Node Exporter ──────────────────────────────────
+  - name: Create node_exporter user
+    user:
+      name: node_exporter
+      shell: /sbin/nologin
+      system: yes
+      create_home: no
+
+  - name: Download node_exporter
+    get_url:
+      url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+      dest: /tmp/node_exporter.tar.gz
+      checksum: "sha256:https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/sha256sums.txt"
+
+  - name: Extract node_exporter
+    unarchive:
+      src: /tmp/node_exporter.tar.gz
+      dest: /tmp/
+      remote_src: yes
+
+  - name: Copy node_exporter binary
+    copy:
+      src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+      dest: /usr/local/bin/node_exporter
+      mode: "0755"
+      owner: node_exporter
+      remote_src: yes
+
+  - name: Create node_exporter systemd service
+    copy:
+      content: |
+        [Unit]
+        Description=Prometheus Node Exporter
+        After=network.target
+
+        [Service]
+        User=node_exporter
+        Group=node_exporter
+        Type=simple
+        ExecStart=/usr/local/bin/node_exporter \
+          --collector.filesystem.mount-points-exclude='^/(sys|proc|dev|host|etc)($|/)' \
+          --web.listen-address=":9100"
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+      dest: /etc/systemd/system/node_exporter.service
+    notify:
+      - Reload systemd
+      - Restart node_exporter
+
+  - name: Open node_exporter port for Prometheus (internal only)
+    ufw:
+      rule: allow
+      port: "9100"
+      src: "{{ prometheus_server_ip }}"
+      proto: tcp
+
+  # ── NTP Configuration ─────────────────────────────────────────
+  - name: Install chrony
+    apt:
+      name: chrony
+      state: present
+
+  - name: Configure NTP servers
+    template:
+      src: chrony.conf.j2
+      dest: /etc/chrony/chrony.conf
+    notify: Restart chrony
+
+  post_tasks:
+  - name: Verify services are running
+    service_facts:
+
+  - name: Assert critical services are running
+    assert:
+      that:
+        - ansible_facts.services['docker.service'].state == 'running'
+        - ansible_facts.services['fail2ban.service'].state == 'running'
+        - ansible_facts.services['ufw.service'].state == 'running'
+
+  handlers:
+  - name: Restart SSH
+    service:
+      name: sshd
+      state: restarted
+
+  - name: Restart fail2ban
+    service:
+      name: fail2ban
+      state: restarted
+
+  - name: Restart Docker
+    service:
+      name: docker
+      state: restarted
+
+  - name: Reload systemd
+    systemd:
+      daemon_reload: yes
+
+  - name: Restart node_exporter
+    service:
+      name: node_exporter
+      state: restarted
+      enabled: yes
+
+  - name: Restart chrony
+    service:
+      name: chrony
+      state: restarted

@@ -1,0 +1,172 @@
+# AWS CodePipeline → ECR → EKS Deployment
+# CloudFormation template: deploy app from GitHub to EKS via CodePipeline
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CI/CD Pipeline — GitHub to EKS
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: myorg/myapp
+  GitHubBranch:
+    Type: String
+    Default: main
+  EksClusterName:
+    Type: String
+  EcrRepository:
+    Type: String
+
+Resources:
+  # ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepository
+      ImageScanningConfiguration:
+        ScanOnPush: true            # Scan images for CVEs on push
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep last 20 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 20
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+              - echo Logging in to Amazon ECR...
+              - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REGISTRY
+              - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-7)
+            build:
+              commands:
+              - echo Building Docker image...
+              - docker build -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG --target production .
+              - docker tag $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPO:latest
+            post_build:
+              commands:
+              - docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+              - docker push $ECR_REGISTRY/$ECR_REPO:latest
+              - printf '[{"name":"app","imageUri":"%s"}]' $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG > imagedefinitions.json
+          artifacts:
+            files:
+            - imagedefinitions.json
+            - k8s/**
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true        # Required for Docker builds
+        EnvironmentVariables:
+        - Name: ECR_REGISTRY
+          Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+        - Name: ECR_REPO
+          Value: !Ref EcrRepository
+      Artifacts:
+        Type: CODEPIPELINE
+
+  # CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}-pipeline
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+      # Stage 1: Source
+      - Name: Source
+        Actions:
+        - Name: GitHubSource
+          ActionTypeId:
+            Category: Source
+            Owner: ThirdParty
+            Provider: GitHub
+            Version: "1"
+          Configuration:
+            Owner: !Select [0, !Split ["/", !Ref GitHubRepo]]
+            Repo: !Select [1, !Split ["/", !Ref GitHubRepo]]
+            Branch: !Ref GitHubBranch
+            OAuthToken: "{{resolve:secretsmanager:github-token}}"
+          OutputArtifacts:
+          - Name: SourceOutput
+
+      # Stage 2: Build
+      - Name: Build
+        Actions:
+        - Name: BuildAndPush
+          ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Provider: CodeBuild
+            Version: "1"
+          Configuration:
+            ProjectName: !Ref CodeBuildProject
+          InputArtifacts:
+          - Name: SourceOutput
+          OutputArtifacts:
+          - Name: BuildOutput
+
+      # Stage 3: Deploy to EKS
+      - Name: Deploy
+        Actions:
+        - Name: DeployToEKS
+          ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Provider: CodeBuild
+            Version: "1"
+          Configuration:
+            ProjectName: !Ref DeployProject
+          InputArtifacts:
+          - Name: BuildOutput
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  # IAM Roles (simplified — use least privilege in production)
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess

@@ -1,0 +1,174 @@
+# Example 03: Services & Ingress
+# All service types + production Ingress with TLS
+
+---
+# ClusterIP — internal only (default)
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+  labels:
+    app: api-service
+spec:
+  type: ClusterIP
+  selector:
+    app: api-service         # Matches pods with this label
+  ports:
+  - name: http
+    port: 80                 # Service port (what callers use)
+    targetPort: 8080         # Container port (what the app listens on)
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+
+---
+# Headless Service — for StatefulSets (direct pod DNS)
+# Returns pod IPs instead of virtual IP
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: database
+spec:
+  type: ClusterIP
+  clusterIP: None            # This makes it headless
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+# Each pod now gets DNS: postgres-0.postgres-headless.database.svc.cluster.local
+
+---
+# NodePort — exposes on every node's IP (dev/testing)
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-nodeport
+  namespace: staging
+spec:
+  type: NodePort
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 3000
+    nodePort: 30080          # Range: 30000-32767. Omit to auto-assign.
+
+---
+# LoadBalancer — cloud load balancer (production external traffic)
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-lb
+  namespace: production
+  annotations:
+    # AWS NLB annotations
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    # GCP annotations
+    # cloud.google.com/load-balancer-type: "External"
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+  - name: https
+    port: 443
+    targetPort: 3000
+  externalTrafficPolicy: Local  # Preserve client IP, route to local node pods only
+
+---
+# ExternalName — DNS alias to external service
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-crm
+  namespace: production
+spec:
+  type: ExternalName
+  externalName: crm.legacy-system.company.com  # CNAME in cluster DNS
+
+---
+# Production Ingress with TLS + multiple backends
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: production-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    # TLS: cert-manager auto-provisions Let's Encrypt certificate
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    # Enable CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.company.com"
+    # Body size limit
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # Force HTTPS
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - api.company.com
+    - app.company.com
+    secretName: company-tls-cert     # cert-manager creates this Secret
+
+  rules:
+  - host: api.company.com
+    http:
+      paths:
+      - path: /v1/auth
+        pathType: Prefix
+        backend:
+          service:
+            name: auth-service
+            port:
+              number: 80
+      - path: /v1/products
+        pathType: Prefix
+        backend:
+          service:
+            name: product-service
+            port:
+              number: 80
+      - path: /v1/orders
+        pathType: Prefix
+        backend:
+          service:
+            name: order-service
+            port:
+              number: 80
+
+  - host: app.company.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+
+---
+# IngressClass — needed with newer Ingress API
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: k8s.io/ingress-nginx

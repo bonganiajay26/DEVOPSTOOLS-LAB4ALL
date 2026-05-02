@@ -1,0 +1,97 @@
+# Example 11: Namespace Setup + Multi-Environment Patterns
+# Foundation manifests used in Terraform + Helm + GitOps integration
+
+---
+# Namespace with standard labels
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    environment: production
+    team: platform
+    cost-center: "engineering"
+    pod-security.kubernetes.io/enforce: restricted     # PSA: enforce restricted policy
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    environment: staging
+    team: platform
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+# Example: ArgoCD Application (GitOps sync target)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-service-production
+  namespace: argocd
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io  # Cascade delete managed resources
+spec:
+  project: production-apps
+
+  source:
+    repoURL: https://github.com/myorg/gitops-repo
+    targetRevision: main
+    path: apps/api-service/overlays/production
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+
+  syncPolicy:
+    automated:
+      prune: true                    # Auto-delete resources removed from Git
+      selfHeal: true                 # Auto-revert manual kubectl changes
+      allowEmpty: false
+    syncOptions:
+    - CreateNamespace=true
+    - PrunePropagationPolicy=foreground
+    - RespectIgnoreDifferences=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /spec/replicas                 # Ignore HPA-managed replica count
+
+---
+# Example: Flux Kustomization (alternative GitOps engine)
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: api-service
+  namespace: flux-system
+spec:
+  interval: 5m                       # Reconcile every 5 minutes
+  sourceRef:
+    kind: GitRepository
+    name: gitops-repo
+  path: ./apps/api-service/overlays/production
+  prune: true
+  healthChecks:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+    namespace: production
+  postBuild:
+    substituteFrom:
+    - kind: ConfigMap
+      name: cluster-vars
+    - kind: Secret
+      name: cluster-secrets
