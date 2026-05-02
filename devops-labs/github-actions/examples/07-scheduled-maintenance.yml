@@ -1,0 +1,124 @@
+# Example 07: Scheduled Maintenance Workflows
+
+name: Scheduled Maintenance
+
+on:
+  schedule:
+  - cron: '0 2 * * 0'    # Sunday 2 AM UTC — weekly cleanup
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: true
+        description: Dry run (no actual deletions)
+
+jobs:
+  # ── Clean up old Docker images ──────────────────────────────
+  cleanup-images:
+    name: Clean Up Old Images
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+    - name: Delete old package versions
+      uses: actions/delete-package-versions@v5
+      with:
+        package-name: myapp
+        package-type: container
+        min-versions-to-keep: 10
+        delete-only-untagged-versions: false
+        ignore-versions: '^(latest|v\d+\.\d+\.\d+)$'    # Keep semantic versions
+
+  # ── Close stale issues and PRs ──────────────────────────────
+  stale:
+    name: Mark Stale Issues/PRs
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+    - uses: actions/stale@v9
+      with:
+        days-before-issue-stale: 60
+        days-before-issue-close: 14
+        days-before-pr-stale: 30
+        days-before-pr-close: 7
+        stale-issue-label: stale
+        stale-pr-label: stale
+        stale-issue-message: |
+          This issue has been inactive for 60 days.
+          It will be closed in 14 days if no further activity occurs.
+        stale-pr-message: |
+          This PR has been inactive for 30 days.
+          Please update or it will be closed in 7 days.
+        exempt-issue-labels: 'pinned,security,bug'
+        exempt-pr-labels: 'work-in-progress,blocked'
+
+  # ── Rotate secrets check ─────────────────────────────────────
+  check-secret-age:
+    name: Check Secret Age
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+    - name: Check AWS key age
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      run: |
+        CREATED=$(aws iam list-access-keys \
+          --query 'AccessKeyMetadata[0].CreateDate' \
+          --output text 2>/dev/null || echo "")
+
+        if [ -n "$CREATED" ]; then
+          AGE_DAYS=$(( ($(date +%s) - $(date -d "$CREATED" +%s)) / 86400 ))
+          echo "AWS key age: $AGE_DAYS days"
+
+          if [ $AGE_DAYS -gt 90 ]; then
+            gh issue create \
+              --title "🔑 AWS access key is $AGE_DAYS days old — rotation needed" \
+              --body "The AWS access key used in CI/CD was created $AGE_DAYS days ago. Rotate it per security policy (90-day max)." \
+              --label "security,action-required"
+          fi
+        fi
+
+  # ── Generate repo health report ──────────────────────────────
+  health-report:
+    name: Weekly Health Report
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: read
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/github-script@v7
+      with:
+        script: |
+          const [owner, repo] = context.repo.owner + '/' + context.repo.repo.split('/');
+
+          // Get stats
+          const [openIssues, openPRs, recentCommits] = await Promise.all([
+            github.rest.issues.listForRepo({ owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 1 }),
+            github.rest.pulls.list({ owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 1 }),
+            github.rest.repos.listCommits({ owner: context.repo.owner, repo: context.repo.repo, per_page: 10 })
+          ]);
+
+          const summary = `
+          ## 📊 Weekly Repository Health Report
+
+          | Metric | Value |
+          |--------|-------|
+          | Open Issues | ${openIssues.headers['x-total-count'] || 'N/A'} |
+          | Open PRs | ${openPRs.headers['x-total-count'] || 'N/A'} |
+          | Commits This Week | ${recentCommits.data.length} |
+          | Last Commit | ${recentCommits.data[0]?.commit.author.date} |
+
+          Generated: ${new Date().toISOString()}
+          `;
+
+          core.summary.addRaw(summary);
+          await core.summary.write();

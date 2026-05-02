@@ -1,0 +1,199 @@
+# Example 05: Terraform CI/CD Pipeline
+# Plan on PR, Apply on merge to main
+
+name: Terraform
+
+on:
+  push:
+    branches: [main]
+    paths: ['infrastructure/**', '.github/workflows/terraform.yml']
+  pull_request:
+    branches: [main]
+    paths: ['infrastructure/**']
+
+defaults:
+  run:
+    working-directory: infrastructure
+
+env:
+  TF_VERSION: '1.7.0'
+  AWS_REGION: us-east-1
+
+jobs:
+  # ── Validate on every PR ──────────────────────────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+      continue-on-error: true   # Comment format issues but don't block
+
+    - name: Terraform Init
+      run: terraform init -backend=false
+
+    - name: Terraform Validate
+      run: terraform validate -no-color
+
+    - name: tflint
+      uses: terraform-linters/setup-tflint@v4
+    - run: |
+        tflint --init
+        tflint --format=compact
+
+    - name: checkov Security Scan
+      uses: bridgecrewio/checkov-action@v12
+      with:
+        directory: infrastructure
+        quiet: true
+        soft_fail: false
+        framework: terraform
+
+  # ── Plan on PR ────────────────────────────────────────────────
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    strategy:
+      matrix:
+        environment: [staging, production]
+
+    defaults:
+      run:
+        working-directory: infrastructure/environments/${{ matrix.environment }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars[format('AWS_ROLE_{0}', matrix.environment)] }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Init
+      run: terraform init
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        terraform plan \
+          -var-file="${{ matrix.environment }}.tfvars" \
+          -out=tfplan \
+          -no-color 2>&1 | tee plan.txt
+        echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+      continue-on-error: true
+
+    - name: Comment Plan on PR
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const plan = fs.readFileSync('infrastructure/environments/${{ matrix.environment }}/plan.txt', 'utf8');
+          const truncated = plan.length > 65000
+            ? plan.substring(0, 65000) + '\n...[truncated]'
+            : plan;
+
+          const exitcode = '${{ steps.plan.outputs.exitcode }}';
+          const status = exitcode === '0' ? '✅ No changes'
+                       : exitcode === '2' ? '⚠️ Changes planned'
+                       : '❌ Plan failed';
+
+          const body = `## Terraform Plan — ${{ matrix.environment }}
+
+          **Status**: ${status}
+
+          <details>
+          <summary>Show Plan</summary>
+
+          \`\`\`hcl
+          ${truncated}
+          \`\`\`
+          </details>`;
+
+          // Delete previous bot comment if exists
+          const comments = await github.rest.issues.listComments({
+            ...context.repo,
+            issue_number: context.issue.number
+          });
+          for (const comment of comments.data) {
+            if (comment.user.type === 'Bot' &&
+                comment.body.includes(`Terraform Plan — ${{ matrix.environment }}`)) {
+              await github.rest.issues.deleteComment({
+                ...context.repo,
+                comment_id: comment.id
+              });
+            }
+          }
+
+          await github.rest.issues.createComment({
+            ...context.repo,
+            issue_number: context.issue.number,
+            body
+          });
+
+    - name: Fail if plan failed
+      if: steps.plan.outputs.exitcode == '1'
+      run: exit 1
+
+  # ── Apply on merge ────────────────────────────────────────────
+  apply:
+    name: Apply (${{ matrix.environment }})
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      matrix:
+        environment: [staging]
+      # Production requires manual approval via environment protection
+      # Add to matrix after staging passes:
+      # max-parallel: 1 (staging before production)
+
+    environment:
+      name: terraform-${{ matrix.environment }}
+
+    defaults:
+      run:
+        working-directory: infrastructure/environments/${{ matrix.environment }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars[format('AWS_ROLE_{0}', matrix.environment)] }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - run: terraform init
+    - run: terraform apply -var-file="${{ matrix.environment }}.tfvars" -auto-approve
+
+    - name: Summarize changes
+      run: |
+        echo "### Terraform Apply — ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "Applied at: $(date)" >> $GITHUB_STEP_SUMMARY

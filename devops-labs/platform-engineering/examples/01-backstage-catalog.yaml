@@ -1,0 +1,259 @@
+# Example 01: Backstage Service Catalog Entries
+# Every service should have a catalog-info.yaml at the repo root
+
+# ── 1. Microservice Component ─────────────────────────────────
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: payment-service
+  title: Payment Service
+  description: "Handles payment processing, refunds, and reconciliation"
+  annotations:
+    github.com/project-slug: myorg/payment-service
+    backstage.io/techdocs-ref: dir:.
+    backstage.io/kubernetes-id: payment-service
+    backstage.io/kubernetes-namespace: production
+    pagerduty.com/service-id: P123ABC
+    grafana/dashboard-selector: "app=payment-service"
+    sonarqube.org/project-key: payment-service
+    vault.io/secrets-path: production/payment-service
+  tags:
+    - payments
+    - critical
+    - java
+    - spring-boot
+  links:
+    - url: https://grafana.company.com/d/payment-svc
+      title: Grafana Dashboard
+      icon: dashboard
+    - url: https://wiki.company.com/runbooks/payment
+      title: Runbook
+      icon: docs
+    - url: https://sonarcloud.io/project/overview?id=payment-service
+      title: Code Quality
+      icon: code
+spec:
+  type: service
+  lifecycle: production
+  owner: group:payments-team
+  system: payment-platform
+  dependsOn:
+    - component:database-cluster
+    - component:fraud-detection-service
+    - resource:payment-queue
+  providesApis:
+    - api:payment-api-v2
+  consumesApis:
+    - api:fraud-api-v1
+    - api:notification-api-v1
+
+---
+# ── 2. API Definition ─────────────────────────────────────────
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: payment-api-v2
+  title: Payment API v2
+  description: "REST API for payment operations"
+  tags: [payments, rest, v2]
+spec:
+  type: openapi
+  lifecycle: production
+  owner: group:payments-team
+  system: payment-platform
+  definition: |
+    openapi: 3.0.0
+    info:
+      title: Payment API
+      version: 2.0.0
+    paths:
+      /payments:
+        post:
+          summary: Create payment
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/Payment'
+          responses:
+            '201':
+              description: Payment created
+      /payments/{id}:
+        get:
+          summary: Get payment by ID
+          parameters:
+          - name: id
+            in: path
+            required: true
+            schema:
+              type: string
+          responses:
+            '200':
+              description: Payment details
+
+---
+# ── 3. Team/Group ─────────────────────────────────────────────
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: payments-team
+  title: Payments Team
+  description: "Team responsible for payment platform"
+  links:
+    - url: https://slack.com/archives/C0PAYMENTS
+      title: Slack Channel
+spec:
+  type: team
+  profile:
+    displayName: Payments Team
+    email: payments@company.com
+    picture: https://company.com/teams/payments.png
+  parent: group:engineering
+  children: []
+  members:
+    - user:alice
+    - user:bob
+    - user:carol
+
+---
+# ── 4. System ─────────────────────────────────────────────────
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: payment-platform
+  title: Payment Platform
+  description: "End-to-end payment processing system"
+  tags: [payments, core-business]
+spec:
+  owner: group:payments-team
+  domain: domain:ecommerce
+
+---
+# ── 5. Infrastructure Resource ────────────────────────────────
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: payment-queue
+  title: Payment SQS Queue
+  description: "AWS SQS queue for async payment processing"
+  annotations:
+    aws.amazon.com/arn: "arn:aws:sqs:us-east-1:123456789:payment-processing"
+spec:
+  type: queue
+  owner: group:payments-team
+  system: payment-platform
+  dependencyOf:
+    - component:payment-service
+    - component:payment-worker
+
+---
+# ── 6. Scaffolding Template (Golden Path) ─────────────────────
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: new-microservice
+  title: New Python Microservice
+  description: "Create a production-ready Python microservice"
+  tags: [python, microservice, recommended]
+spec:
+  owner: group:platform-team
+  type: service
+
+  parameters:
+  - title: Service Details
+    required: [name, description, owner]
+    properties:
+      name:
+        title: Service Name
+        type: string
+        pattern: '^[a-z][a-z0-9-]{2,30}[a-z0-9]$'
+        description: Lowercase, hyphens only (e.g. order-processor)
+      description:
+        title: Description
+        type: string
+      owner:
+        title: Owner Team
+        type: string
+        ui:field: OwnerPicker
+      needs_database:
+        title: PostgreSQL database
+        type: boolean
+        default: false
+      needs_cache:
+        title: Redis cache
+        type: boolean
+        default: false
+
+  - title: Infrastructure
+    properties:
+      cloud_provider:
+        title: Cloud Provider
+        type: string
+        enum: [aws, gcp, azure]
+        default: aws
+      environment:
+        title: Initial Environment
+        type: string
+        enum: [staging, production]
+        default: staging
+
+  steps:
+  - id: fetch-skeleton
+    name: Fetch service skeleton
+    action: fetch:template
+    input:
+      url: ./skeleton
+      values:
+        name: ${{ parameters.name }}
+        description: ${{ parameters.description }}
+        owner: ${{ parameters.owner }}
+        has_db: ${{ parameters.needs_database }}
+        has_cache: ${{ parameters.needs_cache }}
+
+  - id: create-repo
+    name: Create GitHub repository
+    action: publish:github
+    input:
+      repoUrl: github.com?repo=${{ parameters.name }}&owner=myorg
+      description: ${{ parameters.description }}
+      topics: [microservice, python]
+
+  - id: create-db
+    name: Provision PostgreSQL database
+    if: ${{ parameters.needs_database }}
+    action: aws:rds:create
+    input:
+      name: ${{ parameters.name }}-db
+      size: small
+      environment: ${{ parameters.environment }}
+
+  - id: setup-monitoring
+    name: Create Grafana dashboard
+    action: grafana:dashboard:create
+    input:
+      service: ${{ parameters.name }}
+      team: ${{ parameters.owner }}
+
+  - id: setup-pagerduty
+    name: Create PagerDuty service
+    action: pagerduty:service:create
+    input:
+      name: ${{ parameters.name }}
+      escalation_policy: ${{ parameters.owner }}
+
+  - id: register
+    name: Register in catalog
+    action: catalog:register
+    input:
+      repoContentsUrl: ${{ steps.create-repo.output.repoContentsUrl }}
+      catalogInfoPath: /catalog-info.yaml
+
+  output:
+    links:
+    - title: Repository
+      url: ${{ steps.create-repo.output.remoteUrl }}
+    - title: Dashboard
+      url: ${{ steps.setup-monitoring.output.dashboardUrl }}
+    - title: Service in catalog
+      url: ${{ steps.register.output.entityRef }}

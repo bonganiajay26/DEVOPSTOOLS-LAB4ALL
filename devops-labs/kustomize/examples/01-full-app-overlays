@@ -1,0 +1,265 @@
+# Example 01: Complete Kustomize App with Multi-Environment Overlays
+# Directory structure and all files
+
+# ══════════════════════════════════════════
+# Directory tree:
+# apps/myapi/
+# ├── base/
+# │   ├── kustomization.yaml
+# │   ├── deployment.yaml
+# │   ├── service.yaml
+# │   ├── configmap.yaml
+# │   └── hpa.yaml
+# ├── overlays/
+# │   ├── development/
+# │   │   ├── kustomization.yaml
+# │   │   └── patches/
+# │   │       └── dev-patch.yaml
+# │   ├── staging/
+# │   │   ├── kustomization.yaml
+# │   │   └── patches/
+# │   │       └── staging-patch.yaml
+# │   └── production/
+# │       ├── kustomization.yaml
+# │       ├── hpa-patch.yaml
+# │       └── resources-patch.yaml
+# └── components/
+#     ├── monitoring/
+#     │   └── kustomization.yaml
+#     └── security/
+#         └── kustomization.yaml
+# ══════════════════════════════════════════
+
+# ── base/kustomization.yaml ───────────────────────────────────
+# apiVersion: kustomize.config.k8s.io/v1beta1
+# kind: Kustomization
+#
+# resources:
+# - deployment.yaml
+# - service.yaml
+# - configmap.yaml
+# - hpa.yaml
+#
+# commonLabels:
+#   app.kubernetes.io/name: myapi
+#   app.kubernetes.io/component: backend
+#
+# commonAnnotations:
+#   owner: backend-team@company.com
+
+# ── base/deployment.yaml ──────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapi
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: myapi
+  template:
+    metadata:
+      labels:
+        app: myapi
+    spec:
+      containers:
+      - name: api
+        image: myapi:latest
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: myapi-config
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+# ── base/service.yaml ─────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapi
+spec:
+  selector:
+    app: myapi
+  ports:
+  - port: 80
+    targetPort: 8080
+
+---
+# ── base/configmap.yaml ───────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: myapi-config
+data:
+  APP_ENV: base
+  LOG_LEVEL: info
+  MAX_CONNECTIONS: "100"
+
+---
+# ── overlays/development/kustomization.yaml ───────────────────
+# apiVersion: kustomize.config.k8s.io/v1beta1
+# kind: Kustomization
+#
+# resources:
+# - ../../base
+#
+# namespace: development
+#
+# patches:
+# - path: patches/dev-patch.yaml
+#
+# configMapGenerator:
+# - name: myapi-config
+#   behavior: merge
+#   literals:
+#   - APP_ENV=development
+#   - LOG_LEVEL=debug
+#   - MAX_CONNECTIONS=10
+#
+# images:
+# - name: myapi
+#   newTag: dev
+
+---
+# ── overlays/development/patches/dev-patch.yaml ───────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapi
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: api
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+
+---
+# ── overlays/production/kustomization.yaml ────────────────────
+# apiVersion: kustomize.config.k8s.io/v1beta1
+# kind: Kustomization
+#
+# resources:
+# - ../../base
+#
+# namespace: production
+#
+# components:
+# - ../../components/monitoring     # Add Prometheus annotations
+# - ../../components/security       # Add security context
+#
+# patches:
+# - path: hpa-patch.yaml
+# - path: resources-patch.yaml
+#
+# configMapGenerator:
+# - name: myapi-config
+#   behavior: merge
+#   literals:
+#   - APP_ENV=production
+#   - LOG_LEVEL=warn
+#   - MAX_CONNECTIONS=500
+#
+# images:
+# - name: myapi
+#   newName: ghcr.io/myorg/myapi
+#   newTag: abc1234     # Set by CI: kustomize edit set image myapi=...
+
+---
+# ── overlays/production/resources-patch.yaml ──────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapi
+spec:
+  replicas: 10
+  template:
+    spec:
+      containers:
+      - name: api
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+
+---
+# ── overlays/production/hpa-patch.yaml ───────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapi
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapi
+  minReplicas: 10
+  maxReplicas: 50
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+
+---
+# ── components/monitoring/kustomization.yaml ─────────────────
+# apiVersion: kustomize.config.k8s.io/v1alpha1
+# kind: Component
+#
+# patches:
+# - patch: |-
+#     - op: add
+#       path: /spec/template/metadata/annotations
+#       value: {}
+#     - op: add
+#       path: /spec/template/metadata/annotations/prometheus.io~1scrape
+#       value: "true"
+#     - op: add
+#       path: /spec/template/metadata/annotations/prometheus.io~1port
+#       value: "9090"
+#   target:
+#     kind: Deployment
+
+---
+# ── Usage commands ────────────────────────────────────────────
+# Build and preview:
+# kustomize build overlays/development/
+# kustomize build overlays/staging/
+# kustomize build overlays/production/
+
+# Apply:
+# kubectl apply -k overlays/production/
+
+# In CI/CD — update image tag then apply:
+# cd overlays/production
+# kustomize edit set image myapi=ghcr.io/myorg/myapi:${GITHUB_SHA::7}
+# git commit -am "deploy: update myapi to ${GITHUB_SHA::7}"
+# git push
+# (ArgoCD/Flux picks up the change)
+
+# Diff before applying:
+# kubectl diff -k overlays/production/

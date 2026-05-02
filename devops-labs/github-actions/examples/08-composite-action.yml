@@ -1,0 +1,117 @@
+# Example 08: Composite Action — Reusable Setup Step
+# File: .github/actions/setup-python-app/action.yml
+
+name: 'Setup Python Application'
+description: 'Install Python, configure cache, install deps, and optionally run checks'
+author: 'Platform Team'
+
+inputs:
+  python-version:
+    description: 'Python version to use'
+    default: '3.12'
+    required: false
+  working-directory:
+    description: 'Working directory'
+    default: '.'
+    required: false
+  install-command:
+    description: 'Pip install command'
+    default: 'pip install -r requirements.txt'
+    required: false
+  run-lint:
+    description: 'Run linting after install'
+    default: 'false'
+    required: false
+  run-security-check:
+    description: 'Run pip-audit security check'
+    default: 'true'
+    required: false
+
+outputs:
+  python-version:
+    description: 'Installed Python version'
+    value: ${{ steps.setup.outputs.python-version }}
+  cache-hit:
+    description: 'Whether pip cache was used'
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+
+  steps:
+  - name: Set up Python
+    id: setup
+    uses: actions/setup-python@v5
+    with:
+      python-version: ${{ inputs.python-version }}
+
+  - name: Cache pip
+    id: cache
+    uses: actions/cache@v4
+    with:
+      path: |
+        ~/.cache/pip
+        ${{ inputs.working-directory }}/.venv
+      key: >-
+        python-${{ inputs.python-version }}-
+        ${{ runner.os }}-
+        ${{ hashFiles(format('{0}/requirements*.txt', inputs.working-directory)) }}
+      restore-keys: |
+        python-${{ inputs.python-version }}-${{ runner.os }}-
+
+  - name: Upgrade pip
+    shell: bash
+    working-directory: ${{ inputs.working-directory }}
+    run: pip install --upgrade pip
+
+  - name: Install dependencies
+    shell: bash
+    working-directory: ${{ inputs.working-directory }}
+    if: steps.cache.outputs.cache-hit != 'true'
+    run: ${{ inputs.install-command }}
+
+  - name: Run lint
+    shell: bash
+    working-directory: ${{ inputs.working-directory }}
+    if: inputs.run-lint == 'true'
+    run: |
+      pip install ruff --quiet
+      ruff check .
+      echo "✅ Linting passed"
+
+  - name: Security audit
+    shell: bash
+    working-directory: ${{ inputs.working-directory }}
+    if: inputs.run-security-check == 'true'
+    run: |
+      pip install pip-audit --quiet
+      pip-audit --requirement requirements.txt || true
+      echo "✅ Security audit complete"
+
+  - name: Display Python info
+    shell: bash
+    run: |
+      python --version
+      pip --version
+      echo "Python: ${{ steps.setup.outputs.python-version }}"
+      echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
+
+---
+# Usage in a workflow:
+# .github/workflows/test.yml
+
+# jobs:
+#   test:
+#     runs-on: ubuntu-latest
+#     steps:
+#     - uses: actions/checkout@v4
+#
+#     - name: Setup app
+#       uses: ./.github/actions/setup-python-app
+#       with:
+#         python-version: '3.12'
+#         run-lint: 'true'
+#         run-security-check: 'true'
+#
+#     - name: Run tests
+#       run: pytest tests/

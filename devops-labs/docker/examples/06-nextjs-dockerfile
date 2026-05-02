@@ -1,0 +1,58 @@
+# Example 06: Next.js Production Dockerfile (Standalone Mode)
+# Uses Next.js standalone output for minimal runtime image
+# Final size: ~200MB vs ~2GB naive approach
+
+# ── Stage 1: Dependencies ──────────────────────────────────���──
+FROM node:20-alpine AS deps
+RUN apk add --no-cache libc6-compat    # needed for some npm packages on alpine
+WORKDIR /app
+
+# Install dependencies based on lock file
+COPY package.json package-lock.json ./
+# Use npm ci for reproducible installs
+RUN npm ci
+
+# ── Stage 2: Build ────────────────────────────────────────────
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Next.js config: output: 'standalone'
+# This creates a self-contained .next/standalone directory
+
+# Pass build-time env vars
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+
+RUN npm run build
+
+# ── Stage 3: Production runtime ───────────────────────────────
+FROM node:20-alpine AS production
+
+ENV NODE_ENV production
+ENV PORT 3000
+ENV HOSTNAME "0.0.0.0"
+
+# Security: non-root user
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser  --system --uid 1001 nextjs
+
+# Standalone output: only includes server + necessary files
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+
+USER nextjs
+EXPOSE 3000
+
+# next.config.js must have: output: 'standalone'
+CMD ["node", "server.js"]
+
+# next.config.js:
+# module.exports = {
+#   output: 'standalone',
+#   images: {
+#     domains: ['example.com'],
+#   },
+# };

@@ -1,0 +1,161 @@
+# Example 04: Docker Compose with Full Monitoring Stack
+# Includes: App + Postgres + Redis + Prometheus + Grafana + Node Exporter
+
+name: monitored-app
+
+services:
+  # ── Application ───────────────────────────────────────────────
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://app:password@postgres:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+    labels:
+      # Prometheus scraping labels
+      prometheus.scrape: "true"
+      prometheus.port: "9090"
+      prometheus.path: "/metrics"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-net
+      - monitoring-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # ── Data tier ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - app-net
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://app:password@postgres:5432/appdb?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres
+    networks:
+      - app-net
+      - monitoring-net
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+    networks:
+      - app-net
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.56.0
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    ports:
+      - "9121:9121"
+    depends_on:
+      - redis
+    networks:
+      - app-net
+      - monitoring-net
+
+  # ── Monitoring stack ──────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+      - promdata:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle    # Allow hot-reload via POST /-/reload
+    networks:
+      - monitoring-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/app.json
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring-net
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.rootfs=/rootfs
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    networks:
+      - monitoring-net
+
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - monitoring-net
+
+networks:
+  app-net:
+  monitoring-net:
+
+volumes:
+  pgdata:
+  redisdata:
+  promdata:
+  grafanadata:

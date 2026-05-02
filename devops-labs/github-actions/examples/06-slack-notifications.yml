@@ -1,0 +1,131 @@
+# Example 06: Rich Slack Notifications for Deployment Events
+
+name: Deploy with Notifications
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Notify start of deployment
+    - name: Notify deployment start
+      uses: slackapi/slack-github-action@v1.26.0
+      id: slack-start
+      with:
+        channel-id: C0DEPLOYMENTS
+        payload: |
+          {
+            "text": "🚀 Deployment starting",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "🚀 Deployment Started"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                  { "type": "mrkdwn", "text": "*Branch:*\n`${{ github.ref_name }}`" },
+                  { "type": "mrkdwn", "text": "*Commit:*\n`${{ github.sha }}`" },
+                  { "type": "mrkdwn", "text": "*Author:*\n${{ github.actor }}" },
+                  { "type": "mrkdwn", "text": "*Message:*\n${{ github.event.head_commit.message }}" }
+                ]
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "View Run" },
+                    "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+    - name: Run deployment
+      id: deploy
+      run: |
+        echo "Deploying..."
+        # kubectl apply -f k8s/
+        sleep 5
+        echo "Deploy complete"
+
+    # Update Slack message on success
+    - name: Notify deployment success
+      if: success()
+      uses: slackapi/slack-github-action@v1.26.0
+      with:
+        channel-id: C0DEPLOYMENTS
+        update-ts: ${{ steps.slack-start.outputs.ts }}
+        payload: |
+          {
+            "text": "✅ Deployment succeeded",
+            "blocks": [
+              {
+                "type": "header",
+                "text": { "type": "plain_text", "text": "✅ Deployment Succeeded" }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                  { "type": "mrkdwn", "text": "*Commit:*\n`${{ github.sha }}`" },
+                  { "type": "mrkdwn", "text": "*Duration:*\n${{ github.event.head_commit.timestamp }}" }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+    # Update Slack message on failure
+    - name: Notify deployment failure
+      if: failure()
+      uses: slackapi/slack-github-action@v1.26.0
+      with:
+        channel-id: C0DEPLOYMENTS
+        update-ts: ${{ steps.slack-start.outputs.ts }}
+        payload: |
+          {
+            "text": "❌ Deployment FAILED",
+            "blocks": [
+              {
+                "type": "header",
+                "text": { "type": "plain_text", "text": "❌ Deployment FAILED" }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "Deployment failed for `${{ github.repository }}` on commit `${{ github.sha }}`.\n<!here> Please investigate immediately."
+                }
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "View Logs" },
+                    "style": "danger",
+                    "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

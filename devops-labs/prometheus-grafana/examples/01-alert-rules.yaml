@@ -1,0 +1,220 @@
+# Example 01: Production Alert Rules
+# Complete alerting ruleset for a Kubernetes-hosted application
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: production-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+    app: myapp
+
+spec:
+  groups:
+  # ── SLO Alerts ────────────────────────────────────────────────
+  - name: slo-alerts
+    rules:
+    # Availability SLO: 99.9% = max 43.2 min downtime/month
+    - alert: SLOAvailabilityBudgetBurning
+      expr: |
+        (
+          sum(rate(http_requests_total{status=~"5..",job="myapp"}[5m]))
+          /
+          sum(rate(http_requests_total{job="myapp"}[5m]))
+        ) > (14.4 * 0.001)
+      for: 2m
+      labels:
+        severity: critical
+        slo: availability
+        service: myapp
+      annotations:
+        summary: "{{ $labels.service }} burning error budget 14x — critical"
+        description: "Error rate {{ $value | humanizePercentage }}. At this rate budget exhausts in <5 days."
+        runbook: "https://wiki.company.com/runbooks/high-error-rate"
+        dashboard: "https://grafana.company.com/d/app-overview"
+
+    - alert: SLOLatencyBudgetBurning
+      expr: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket{job="myapp"}[5m])) by (le)
+        ) > 1.0
+      for: 5m
+      labels:
+        severity: warning
+        slo: latency
+        service: myapp
+      annotations:
+        summary: "{{ $labels.service }} p99 latency > 1s"
+        description: "p99 latency is {{ $value | humanizeDuration }}"
+        runbook: "https://wiki.company.com/runbooks/high-latency"
+
+  # ── Infrastructure Alerts ─────────────────────────────────────
+  - name: infrastructure
+    rules:
+    - alert: NodeHighCPU
+      expr: |
+        (
+          1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (node)
+        ) > 0.90
+      for: 10m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "Node {{ $labels.node }} CPU > 90%"
+        description: "CPU usage is {{ $value | humanizePercentage }}"
+
+    - alert: NodeHighMemory
+      expr: |
+        (
+          node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+        ) / node_memory_MemTotal_bytes > 0.90
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Node {{ $labels.instance }} memory > 90%"
+
+    - alert: DiskWillFillIn24Hours
+      expr: |
+        predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[1h], 24 * 3600) < 0
+      for: 1h
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "Disk on {{ $labels.instance }} will fill in < 24h"
+        description: "Current available: {{ $value | humanize1024 }}B"
+
+    - alert: DiskAlmostFull
+      expr: |
+        (node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"})
+        / node_filesystem_size_bytes{mountpoint="/"} > 0.85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Disk {{ $labels.instance }}:{{ $labels.mountpoint }} > 85% full"
+
+  # ── Kubernetes Alerts ─────────────────────────────────────────
+  - name: kubernetes
+    rules:
+    - alert: PodCrashLoopBackOff
+      expr: |
+        sum(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}) by (namespace, pod) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is CrashLoopBackOff"
+        runbook: "https://wiki.company.com/runbooks/crashloopbackoff"
+
+    - alert: PodNotReady
+      expr: |
+        sum(kube_pod_status_ready{condition="false"}) by (namespace, pod) > 0
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} not ready for 15m"
+
+    - alert: DeploymentReplicasMismatch
+      expr: |
+        kube_deployment_spec_replicas{namespace="production"}
+        !=
+        kube_deployment_status_replicas_available{namespace="production"}
+      for: 15m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} replica mismatch"
+        description: "Desired: {{ $value }} available replicas. Check pod events."
+
+    - alert: HPAMaxedOut
+      expr: |
+        kube_horizontalpodautoscaler_status_current_replicas
+        ==
+        kube_horizontalpodautoscaler_spec_max_replicas
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "HPA {{ $labels.namespace }}/{{ $labels.horizontalpodautoscaler }} at max replicas"
+        description: "Application may be under-provisioned. Consider increasing maxReplicas."
+
+    - alert: PodOOMKilled
+      expr: |
+        kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} > 0
+      for: 0m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} OOM killed"
+        description: "Container {{ $labels.container }} was OOM killed. Increase memory limits."
+
+  # ── Database Alerts ───────────────────────────────────────────
+  - name: database
+    rules:
+    - alert: PostgresHighConnections
+      expr: |
+        pg_stat_database_numbackends{datname!="template0",datname!="template1"}
+        /
+        pg_settings_max_connections
+        > 0.80
+      for: 5m
+      labels:
+        severity: warning
+        team: database
+      annotations:
+        summary: "PostgreSQL connection count > 80%"
+
+    - alert: PostgresReplicationLag
+      expr: |
+        pg_replication_lag > 30
+      for: 2m
+      labels:
+        severity: critical
+        team: database
+      annotations:
+        summary: "PostgreSQL replication lag > 30 seconds"
+        description: "Lag: {{ $value }}s. Data loss risk if primary fails."
+
+    - alert: PostgresSlowQueries
+      expr: |
+        rate(pg_stat_database_blks_hit[5m])
+        /
+        (rate(pg_stat_database_blks_hit[5m]) + rate(pg_stat_database_blks_read[5m]))
+        < 0.90
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "PostgreSQL cache hit rate < 90%"
+        description: "Cache hit rate: {{ $value | humanizePercentage }}. May need more shared_buffers."
+
+  # ── Recording Rules (pre-compute expensive queries) ───────────
+  - name: recording-rules
+    interval: 1m
+    rules:
+    - record: job:http_requests_total:rate5m
+      expr: |
+        sum(rate(http_requests_total[5m])) by (job)
+
+    - record: job:http_errors_total:rate5m
+      expr: |
+        sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+
+    - record: job:http_error_rate:ratio5m
+      expr: |
+        job:http_errors_total:rate5m / job:http_requests_total:rate5m
+
+    - record: job:http_latency_p99:5m
+      expr: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le)
+        )
+
+    - record: instance:node_cpu_utilization:avg5m
+      expr: |
+        1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)

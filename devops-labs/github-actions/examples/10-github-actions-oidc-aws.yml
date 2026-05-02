@@ -1,0 +1,127 @@
+# Example 10: OIDC-Based AWS Authentication (Zero Long-Lived Credentials)
+# Setup guide + workflow example
+
+# ══════════════════════════════════════════
+# AWS SETUP (run once in AWS console/CLI)
+# ══════════════════════════════════════════
+#
+# 1. Create OIDC Identity Provider in IAM
+# aws iam create-open-id-connect-provider \
+#   --url https://token.actions.githubusercontent.com \
+#   --client-id-list sts.amazonaws.com \
+#   --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+#
+# 2. Create IAM Role with trust policy
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [{
+#     "Effect": "Allow",
+#     "Principal": {
+#       "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+#     },
+#     "Action": "sts:AssumeRoleWithWebIdentity",
+#     "Condition": {
+#       "StringEquals": {
+#         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+#       },
+#       "StringLike": {
+#         "token.actions.githubusercontent.com:sub": "repo:MY_ORG/MY_REPO:*"
+#       }
+#     }
+#   }]
+# }
+#
+# 3. For branch-specific restriction (more secure):
+# "token.actions.githubusercontent.com:sub": "repo:MY_ORG/MY_REPO:ref:refs/heads/main"
+#
+# 4. For environment-specific restriction (recommended for prod):
+# "token.actions.githubusercontent.com:sub": "repo:MY_ORG/MY_REPO:environment:production"
+
+name: AWS OIDC Authentication Demo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging (OIDC)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write    # REQUIRED for OIDC
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Configure AWS credentials via OIDC
+    # No AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY needed!
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::123456789012:role/github-actions-staging
+        role-session-name: GHActions-${{ github.run_id }}
+        aws-region: us-east-1
+        role-duration-seconds: 3600    # 1 hour max session
+
+    # Verify credentials
+    - name: Verify AWS identity
+      run: aws sts get-caller-identity
+
+    # Push to ECR using the OIDC credentials
+    - name: Login to Amazon ECR
+      id: ecr-login
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and push to ECR
+      run: |
+        ECR_REGISTRY=${{ steps.ecr-login.outputs.registry }}
+        docker build -t $ECR_REGISTRY/myapp:${{ github.sha }} .
+        docker push $ECR_REGISTRY/myapp:${{ github.sha }}
+
+    # Deploy to EKS
+    - name: Update EKS kubeconfig
+      run: aws eks update-kubeconfig --name staging-cluster --region us-east-1
+
+    - name: Deploy to EKS
+      run: |
+        kubectl set image deployment/myapp \
+          app=${{ steps.ecr-login.outputs.registry }}/myapp:${{ github.sha }} \
+          -n staging
+        kubectl rollout status deployment/myapp -n staging
+
+  # Production uses a DIFFERENT role with tighter restrictions
+  deploy-production:
+    name: Deploy to Production (OIDC)
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: production    # Requires approval
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Production role: only callable from 'production' GitHub Environment
+    - name: Configure AWS credentials (production)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::123456789012:role/github-actions-production
+        role-session-name: GHActions-Prod-${{ github.run_id }}
+        aws-region: us-east-1
+
+    - name: Login to Amazon ECR
+      id: ecr-login
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Deploy to production EKS
+      run: |
+        aws eks update-kubeconfig --name production-cluster --region us-east-1
+        kubectl set image deployment/myapp \
+          app=${{ steps.ecr-login.outputs.registry }}/myapp:${{ github.sha }} \
+          -n production
+        kubectl rollout status deployment/myapp -n production --timeout=10m

@@ -4,7 +4,8 @@
       "Bash(Get-ChildItem -Recurse C:\\\\Users\\\\ajayd\\\\DEVOPSTOOLS-LAB4ALL -File)",
       "Bash(Select-Object FullName)",
       "Bash(Sort-Object FullName)",
-      "Bash(Format-Table -AutoSize)"
+      "Bash(Format-Table -AutoSize)",
+      "PowerShell(Set-Location \"C:\\\\Users\\\\ajayd\\\\DEVOPSTOOLS-LAB4ALL\"; git status --short 2>&1 | Where-Object { $_ -notmatch \"warning\" } | Select-Object -First 30)"
     ]
   }
 }

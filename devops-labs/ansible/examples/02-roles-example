@@ -1,0 +1,222 @@
+# Example 02: Ansible Role — Complete Example
+# Role: deploy-app (deploy a Python app to multiple servers)
+
+# ══════════════════════════════════════════
+# roles/deploy-app/defaults/main.yml
+# ══════════════════════════════════════════
+---
+# Application settings
+app_name: myapp
+app_user: "{{ app_name }}"
+app_group: "{{ app_name }}"
+app_home: "/opt/{{ app_name }}"
+app_version: latest
+app_port: 8080
+
+# Python settings
+python_version: "3.12"
+
+# Service settings
+app_workers: 4
+app_timeout: 30
+
+# Environment (override per host/group)
+app_environment: production
+app_log_level: info
+
+# ══════════════════════════════════════════
+# roles/deploy-app/tasks/main.yml
+# ══════════════════════════════════════════
+---
+- name: Include OS-specific variables
+  include_vars: "{{ ansible_os_family }}.yml"
+  tags: [always]
+
+- import_tasks: install.yml
+  tags: [install]
+
+- import_tasks: configure.yml
+  tags: [configure]
+
+- import_tasks: deploy.yml
+  tags: [deploy]
+
+- import_tasks: verify.yml
+  tags: [verify]
+
+# ══════════════════════════════════════════
+# roles/deploy-app/tasks/install.yml
+# ══════════════════════════════════════════
+---
+- name: Install system packages
+  package:
+    name:
+      - python3
+      - python3-pip
+      - python3-venv
+      - nginx
+      - supervisor
+    state: present
+
+- name: Create app user
+  user:
+    name: "{{ app_user }}"
+    group: "{{ app_group }}"
+    system: yes
+    shell: /sbin/nologin
+    home: "{{ app_home }}"
+    create_home: yes
+
+- name: Create app directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode: "0755"
+  loop:
+    - "{{ app_home }}"
+    - "{{ app_home }}/releases"
+    - "{{ app_home }}/shared/logs"
+    - "{{ app_home }}/shared/config"
+
+# ══════════════════════════════════════════
+# roles/deploy-app/tasks/deploy.yml
+# ══════════════════════════════════════════
+---
+- name: Set release timestamp
+  set_fact:
+    release_timestamp: "{{ ansible_date_time.epoch }}"
+
+- name: Set release directory
+  set_fact:
+    release_dir: "{{ app_home }}/releases/{{ release_timestamp }}"
+
+- name: Create release directory
+  file:
+    path: "{{ release_dir }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+
+- name: Download app release
+  get_url:
+    url: "https://releases.company.com/{{ app_name }}/{{ app_version }}.tar.gz"
+    dest: "/tmp/{{ app_name }}-{{ app_version }}.tar.gz"
+    checksum: "sha256:{{ app_checksum }}"
+
+- name: Extract release
+  unarchive:
+    src: "/tmp/{{ app_name }}-{{ app_version }}.tar.gz"
+    dest: "{{ release_dir }}"
+    remote_src: yes
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+
+- name: Install Python dependencies in virtualenv
+  pip:
+    requirements: "{{ release_dir }}/requirements.txt"
+    virtualenv: "{{ release_dir }}/venv"
+    virtualenv_python: python3
+
+- name: Link shared config
+  file:
+    src: "{{ app_home }}/shared/config/{{ item }}"
+    dest: "{{ release_dir }}/{{ item }}"
+    state: link
+    owner: "{{ app_user }}"
+  loop:
+    - ".env"
+    - "config.yml"
+
+- name: Update current symlink (atomic)
+  file:
+    src: "{{ release_dir }}"
+    dest: "{{ app_home }}/current"
+    state: link
+    owner: "{{ app_user }}"
+  notify:
+    - Restart app
+    - Reload nginx
+
+- name: Keep only last 5 releases
+  shell: |
+    ls -1dt {{ app_home }}/releases/*/ | tail -n +6 | xargs rm -rf
+  changed_when: false
+
+# ══════════════════════════════════════════
+# roles/deploy-app/tasks/verify.yml
+# ══════════════════════════════════════════
+---
+- name: Wait for app to start
+  wait_for:
+    port: "{{ app_port }}"
+    timeout: 30
+
+- name: Verify app health
+  uri:
+    url: "http://localhost:{{ app_port }}/health"
+    status_code: 200
+    return_content: yes
+  register: health_check
+  retries: 5
+  delay: 3
+  until: health_check.status == 200
+
+- name: Show health check response
+  debug:
+    var: health_check.json
+
+# ══════════════════════════════════════════
+# roles/deploy-app/handlers/main.yml
+# ══════════════════════════════════════════
+---
+- name: Restart app
+  supervisorctl:
+    name: "{{ app_name }}"
+    state: restarted
+
+- name: Reload nginx
+  service:
+    name: nginx
+    state: reloaded
+
+# ══════════════════════════════════════════
+# roles/deploy-app/templates/supervisor.conf.j2
+# ══════════════════════════════════════════
+[program:{{ app_name }}]
+command={{ app_home }}/current/venv/bin/gunicorn
+    --bind 0.0.0.0:{{ app_port }}
+    --workers {{ app_workers }}
+    --timeout {{ app_timeout }}
+    --access-logfile {{ app_home }}/shared/logs/access.log
+    --error-logfile {{ app_home }}/shared/logs/error.log
+    {{ app_name }}.wsgi:application
+directory={{ app_home }}/current
+user={{ app_user }}
+autostart=true
+autorestart=true
+environment=
+    APP_ENV="{{ app_environment }}",
+    LOG_LEVEL="{{ app_log_level }}"
+stdout_logfile={{ app_home }}/shared/logs/stdout.log
+stderr_logfile={{ app_home }}/shared/logs/stderr.log
+
+# ══════════════════════════════════════════
+# Usage — site.yml
+# ══════════════════════════════════════════
+---
+- name: Deploy application
+  hosts: webservers
+  become: true
+
+  roles:
+  - role: deploy-app
+    vars:
+      app_version: "2.3.1"
+      app_port: 8080
+      app_workers: "{{ ansible_processor_vcpus * 2 }}"
+
+# Run:
+# ansible-playbook site.yml -i inventory.ini -e "app_version=2.3.1"
+# ansible-playbook site.yml -i inventory.ini --tags deploy --limit prod-web-01

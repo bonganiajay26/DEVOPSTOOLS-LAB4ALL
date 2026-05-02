@@ -1,0 +1,176 @@
+# Example 01: SLO Configuration and Error Budget Monitoring
+# Uses SLOTH (SLO generator) and Pyrra for SLO management
+
+# ── SLOTH: Generate SLO-based alerting ────────────────────────
+# Install: helm install sloth sloth/sloth -n monitoring
+# Docs: https://sloth.dev/
+
+apiVersion: sloth.slok.dev/v1
+kind: PrometheusServiceLevel
+metadata:
+  name: api-service-slos
+  namespace: monitoring
+
+spec:
+  service: api-service
+  labels:
+    owner: backend-team
+    tier: critical
+
+  slos:
+  # SLO 1: Availability — 99.9% requests succeed
+  - name: availability
+    description: "99.9% of requests return 2xx/3xx"
+    objective: 99.9
+
+    sli:
+      events:
+        errorQuery: |
+          sum(rate(http_requests_total{job="api-service", status=~"5.."}[{{.window}}]))
+        totalQuery: |
+          sum(rate(http_requests_total{job="api-service"}[{{.window}}]))
+
+    alerting:
+      name: APIServiceHighErrorRate
+      labels:
+        severity: critical
+        routing: pagerduty
+      annotations:
+        summary: "API Service availability SLO violation"
+        runbook: "https://wiki.company.com/runbooks/api-availability"
+      pageAlert:
+        labels:
+          severity: critical
+      ticketAlert:
+        labels:
+          severity: warning
+
+  # SLO 2: Latency — 95% of requests complete in < 300ms
+  - name: latency
+    description: "95% of requests complete in < 300ms"
+    objective: 95.0
+
+    sli:
+      events:
+        errorQuery: |
+          sum(rate(http_request_duration_seconds_bucket{job="api-service", le="0.3"}[{{.window}}]))
+        totalQuery: |
+          sum(rate(http_request_duration_seconds_count{job="api-service"}[{{.window}}]))
+
+    alerting:
+      name: APIServiceHighLatency
+      labels:
+        severity: warning
+        routing: slack-warnings
+      annotations:
+        summary: "API Service latency SLO violation"
+        runbook: "https://wiki.company.com/runbooks/api-latency"
+      pageAlert:
+        labels:
+          severity: warning
+      ticketAlert:
+        labels:
+          severity: info
+
+---
+# ── Manual PrometheusRules for SLO tracking ───────────────────
+# (Without SLOTH — manual multi-window error budget alerts)
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-slo-manual
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+
+spec:
+  groups:
+  # ── Recording rules for SLO calculations ─────────────────────
+  - name: api-slo-recording
+    interval: 1m
+    rules:
+    # 5-minute error rate
+    - record: job:api:error_rate5m
+      expr: |
+        sum(rate(http_requests_total{job="api-service", status=~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total{job="api-service"}[5m]))
+
+    # 30-day error rate (for SLO compliance tracking)
+    - record: job:api:error_rate30d
+      expr: |
+        sum(rate(http_requests_total{job="api-service", status=~"5.."}[30d]))
+        /
+        sum(rate(http_requests_total{job="api-service"}[30d]))
+
+    # Error budget remaining (for dashboards)
+    # = (SLO target - actual error rate) / (1 - SLO target) * 100
+    - record: job:api:error_budget_remaining
+      expr: |
+        ((0.001 - job:api:error_rate30d) / 0.001) * 100
+
+    # Burn rate (current vs budget)
+    - record: job:api:burn_rate5m
+      expr: |
+        job:api:error_rate5m / 0.001
+
+    # Latency quantiles
+    - record: job:api:latency_p50
+      expr: |
+        histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{job="api-service"}[5m])) by (le))
+
+    - record: job:api:latency_p99
+      expr: |
+        histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job="api-service"}[5m])) by (le))
+
+  # ── Multi-window, multi-burn-rate alerts ─────────────────────
+  # Based on Google SRE Workbook algorithm
+  - name: api-slo-alerts
+    rules:
+    # CRITICAL: Fast burn — consuming 2% budget in 1 hour (14.4x burn rate)
+    # Will exhaust budget in ~2 days at this rate
+    - alert: APIErrorBudgetFastBurn
+      expr: |
+        job:api:burn_rate5m > 14.4
+        and
+        sum(rate(http_requests_total{job="api-service", status=~"5.."}[5m])) > 0.001
+      for: 2m
+      labels:
+        severity: critical
+        slo: availability
+        team: backend
+        page: "true"
+      annotations:
+        summary: "API error budget burning 14x too fast"
+        description: "Error rate {{ $value | humanize }}x normal. Budget exhausts in < 2 days."
+        runbook: "https://wiki.company.com/runbooks/error-budget"
+
+    # WARNING: Slow burn — 5% budget in 6 hours (6x burn rate)
+    # Will exhaust budget in ~5 days
+    - alert: APIErrorBudgetSlowBurn
+      expr: |
+        sum(rate(http_requests_total{job="api-service", status=~"5.."}[6h]))
+        /
+        sum(rate(http_requests_total{job="api-service"}[6h]))
+        > (6 * 0.001)
+      for: 30m
+      labels:
+        severity: warning
+        slo: availability
+        team: backend
+        page: "false"
+      annotations:
+        summary: "API error budget burning 6x too fast"
+        description: "Sustained elevated error rate. Error budget at risk."
+
+    # ERROR BUDGET NEARLY EXHAUSTED
+    - alert: APIErrorBudgetExhausted
+      expr: job:api:error_budget_remaining < 10
+      for: 5m
+      labels:
+        severity: critical
+        page: "true"
+      annotations:
+        summary: "API error budget < 10% remaining this month"
+        description: "{{ $value | humanize }}% budget remaining. Feature freeze recommended."
