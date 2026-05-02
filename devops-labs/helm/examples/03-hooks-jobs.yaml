@@ -1,0 +1,144 @@
+# Example 03: Helm Hooks — Pre-upgrade DB Migration + Post-install Notification
+
+---
+# ── Pre-upgrade DB migration (runs BEFORE new pods start) ─────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "myapp.fullname" . }}-migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"                    # Runs first (lower = earlier)
+    "helm.sh/hook-delete-policy": hook-succeeded   # Clean up on success
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 300      # Fail if migration takes > 5 min
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+      # Wait for database to be ready before running migration
+      - name: wait-for-db
+        image: busybox:1.36
+        command: ['sh', '-c',
+          'until nc -z {{ .Values.database.host }} {{ .Values.database.port }};
+           do echo "Waiting for DB..."; sleep 3; done']
+      containers:
+      - name: migrate
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        command: ["python", "manage.py", "migrate", "--noinput"]
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "myapp.fullname" . }}-secrets
+              key: database-url
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+---
+# ── Pre-upgrade: backup DB before migration ───────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "myapp.fullname" . }}-backup
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"                   # Runs BEFORE migration
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: backup
+        image: postgres:15-alpine
+        command:
+        - sh
+        - -c
+        - |
+          pg_dump $DATABASE_URL | gzip | aws s3 cp - \
+            s3://myapp-backups/pre-upgrade-$(date +%Y%m%d-%H%M%S).sql.gz
+          echo "Backup complete"
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "myapp.fullname" . }}-secrets
+              key: database-url
+
+---
+# ── Post-install: send deployment notification ────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "myapp.fullname" . }}-notify
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": hook-succeeded,hook-failed
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: notify
+        image: curlimages/curl:latest
+        command:
+        - sh
+        - -c
+        - |
+          curl -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"✅ *{{ .Release.Name }}* deployed to *{{ .Release.Namespace }}*\",
+              \"attachments\": [{
+                \"color\": \"good\",
+                \"fields\": [
+                  {\"title\": \"Chart\",   \"value\": \"{{ .Chart.Name }}-{{ .Chart.Version }}\", \"short\": true},
+                  {\"title\": \"Version\", \"value\": \"{{ .Values.image.tag }}\", \"short\": true},
+                  {\"title\": \"Revision\",\"value\": \"{{ .Release.Revision }}\", \"short\": true}
+                ]
+              }]
+            }"
+        env:
+        - name: SLACK_WEBHOOK
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "myapp.fullname" . }}-secrets
+              key: slack-webhook
+
+---
+# ── Test hook (runs on: helm test myapp) ─────────────────────
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "myapp.fullname" . }}-test-health
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: curlimages/curl:latest
+    command:
+    - sh
+    - -c
+    - |
+      # Test 1: health check
+      curl -sf "http://{{ include "myapp.fullname" . }}:{{ .Values.service.port }}/health" || exit 1
+      echo "✅ Health check passed"
+
+      # Test 2: API responds
+      curl -sf "http://{{ include "myapp.fullname" . }}:{{ .Values.service.port }}/api/v1/status" || exit 1
+      echo "✅ API check passed"
+
+      echo "All tests passed!"

@@ -1,0 +1,130 @@
+{
+  "title": "SLO Error Budget Dashboard",
+  "uid": "slo-error-budget",
+  "tags": ["slo", "error-budget", "production"],
+  "refresh": "1m",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Error Budget Remaining (%)",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "((0.001 - (sum(rate(http_requests_total{status=~\"5..\"}[30d])) / sum(rate(http_requests_total[30d])))) / 0.001) * 100",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0, "max": 100,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "green", "value": 50 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "30-Day Error Rate vs SLO Target",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[24h])) / sum(rate(http_requests_total[24h])) * 100",
+          "legendFormat": "Error rate (24h window)"
+        },
+        {
+          "expr": "vector(0.1)",
+          "legendFormat": "SLO target (0.1%)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent" }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Burn Rate (5m vs 1h vs 6h)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "(sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))) / 0.001",
+          "legendFormat": "5m burn rate"
+        },
+        {
+          "expr": "(sum(rate(http_requests_total{status=~\"5..\"}[1h])) / sum(rate(http_requests_total[1h]))) / 0.001",
+          "legendFormat": "1h burn rate"
+        },
+        {
+          "expr": "(sum(rate(http_requests_total{status=~\"5..\"}[6h])) / sum(rate(http_requests_total[6h]))) / 0.001",
+          "legendFormat": "6h burn rate"
+        },
+        {
+          "expr": "vector(14.4)",
+          "legendFormat": "Critical threshold (14.4x)"
+        },
+        {
+          "expr": "vector(6)",
+          "legendFormat": "Warning threshold (6x)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Downtime Minutes (30d)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 16 },
+      "targets": [{
+        "expr": "(sum(rate(http_requests_total{status=~\"5..\"}[30d])) / sum(rate(http_requests_total[30d]))) * 30 * 24 * 60",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": { "unit": "m" }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Budget Remaining (minutes)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 16 },
+      "targets": [{
+        "expr": "((0.001 - (sum(rate(http_requests_total{status=~\"5..\"}[30d])) / sum(rate(http_requests_total[30d])))) / 0.001) * 0.001 * 30 * 24 * 60",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": { "unit": "m" }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Days Until Budget Exhausted",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 16 },
+      "targets": [{
+        "expr": "((0.001 - (sum(rate(http_requests_total{status=~\"5..\"}[30d])) / sum(rate(http_requests_total[30d])))) / 0.001) / ((sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))) / 0.001) * 30",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "green", "value": 15 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

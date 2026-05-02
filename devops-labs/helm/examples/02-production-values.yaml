@@ -1,0 +1,186 @@
+# Example 02: Production-grade values.yaml for a microservice chart
+# Override with: helm install myapp ./mychart -f production-values.yaml
+
+# ── Image ─────────────────────────────────────────────────────
+replicaCount: 5
+
+image:
+  repository: ghcr.io/myorg/myapp
+  pullPolicy: IfNotPresent
+  tag: ""              # Set by CI: --set image.tag=abc1234
+
+imagePullSecrets:
+- name: ghcr-credentials
+
+# ── Service Account + IRSA ────────────────────────────────────
+serviceAccount:
+  create: true
+  name: myapp-sa
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789:role/myapp-production"
+
+# ── Service ───────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+
+# ── Ingress ───────────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  hosts:
+  - host: api.company.com
+    paths:
+    - path: /
+      pathType: Prefix
+  tls:
+  - secretName: api-company-tls
+    hosts:
+    - api.company.com
+
+# ── Resources (Guaranteed QoS) ────────────────────────────────
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2000m"
+    memory: "2Gi"
+
+# ── Autoscaling ───────────────────────────────────────────────
+autoscaling:
+  enabled: true
+  minReplicas: 5
+  maxReplicas: 50
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 75
+
+# ── Pod Disruption Budget ─────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 3
+
+# ── Anti-affinity (spread pods across nodes) ─────────────────
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: myapp
+      topologyKey: kubernetes.io/hostname
+
+# Spread across availability zones
+topologySpreadConstraints:
+- maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
+  labelSelector:
+    matchLabels:
+      app.kubernetes.io/name: myapp
+
+# ── Security Context ──────────────────────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL
+
+# ── Probes ────────────────────────────────────────────────────
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health/started
+    port: 8080
+  failureThreshold: 30
+  periodSeconds: 10
+
+# ── Environment Variables ─────────────────────────────────────
+env:
+  APP_ENV: production
+  LOG_LEVEL: warn
+  METRICS_ENABLED: "true"
+
+envFrom:
+- secretRef:
+    name: myapp-secrets
+
+# ── ConfigMap ─────────────────────────────────────────────────
+configMap:
+  data:
+    app.properties: |
+      server.port=8080
+      management.endpoints.web.exposure.include=health,metrics,info
+
+# ── Volumes for read-only filesystem ─────────────────────────
+extraVolumes:
+- name: tmp
+  emptyDir: {}
+- name: cache
+  emptyDir: {}
+
+extraVolumeMounts:
+- name: tmp
+  mountPath: /tmp
+- name: cache
+  mountPath: /app/cache
+
+# ── Node Selector (optional GPU/SSD nodes) ────────────────────
+nodeSelector: {}
+
+tolerations: []
+
+# ── Lifecycle ─────────────────────────────────────────────────
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 10"]   # Drain in-flight requests
+
+terminationGracePeriodSeconds: 30
+
+# ── Network Policy ────────────────────────────────────────────
+networkPolicy:
+  enabled: true
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: database
+    ports:
+    - port: 5432

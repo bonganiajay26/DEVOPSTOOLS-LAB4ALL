@@ -1,0 +1,128 @@
+# Example 03: Kustomize Components — Reusable Cross-Cutting Concerns
+# Components are like optional modules that can be included in any overlay
+
+---
+# ── Component: Monitoring ─────────────────────────────────────
+# components/monitoring/kustomization.yaml
+# Add Prometheus scraping annotations to all deployments
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+- patch: |-
+    - op: add
+      path: /spec/template/metadata/annotations/prometheus.io~1scrape
+      value: "true"
+    - op: add
+      path: /spec/template/metadata/annotations/prometheus.io~1port
+      value: "9090"
+    - op: add
+      path: /spec/template/metadata/annotations/prometheus.io~1path
+      value: "/metrics"
+  target:
+    kind: Deployment
+
+---
+# ── Component: Security Hardening ────────────────────────────
+# components/security/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: PLACEHOLDER
+    spec:
+      template:
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: PLACEHOLDER
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                - ALL
+  target:
+    kind: Deployment
+
+---
+# ── Component: Spot Tolerance ─────────────────────────────────
+# components/spot-tolerations/kustomization.yaml
+# Allow pods to run on spot/preemptible nodes (cost saving)
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+- patch: |-
+    - op: add
+      path: /spec/template/spec/tolerations
+      value:
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      - key: "kubernetes.azure.com/scalesetpriority"
+        operator: "Equal"
+        value: "spot"
+        effect: "NoSchedule"
+  target:
+    kind: Deployment
+
+---
+# ── Component: Anti-affinity ─────────────────────────────────
+# components/anti-affinity/kustomization.yaml
+# Spread pods across nodes for HA
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+- patch: |-
+    - op: add
+      path: /spec/template/spec/topologySpreadConstraints
+      value:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: WILL_BE_REPLACED_BY_LABEL
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: WILL_BE_REPLACED_BY_LABEL
+  target:
+    kind: Deployment
+
+---
+# ── Production overlay using components ──────────────────────
+# overlays/production/kustomization.yaml
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../../base
+
+namespace: production
+
+# Include optional components
+components:
+- ../../components/monitoring      # ALL environments get monitoring
+- ../../components/security        # ALL environments get security hardening
+- ../../components/anti-affinity   # Production: spread across zones
+
+# Note: spot-tolerations component NOT included in production
+# It would be included in staging/dev overlays:
+# components:
+# - ../../components/monitoring
+# - ../../components/spot-tolerations    # Dev: use spot instances to save cost

@@ -1,0 +1,211 @@
+# Example 02: Crossplane Compositions — Self-Service Infrastructure
+
+# ── 1. CompositeResourceDefinition (XRD) — Define the API ────
+# This creates the CRD that developers use
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xpostgresqlinstances.platform.company.com
+spec:
+  # Group and version for the composite resource
+  group: platform.company.com
+  names:
+    kind: XPostgreSQLInstance
+    plural: xpostgresqlinstances
+
+  # Namespace-scoped version (for developers to use in their namespace)
+  claimNames:
+    kind: PostgreSQLInstance
+    plural: postgresqlinstances
+
+  versions:
+  - name: v1alpha1
+    served: true
+    referenceable: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required: [size, version]
+            properties:
+              size:
+                type: string
+                enum: [small, medium, large]
+                description: |
+                  small  = db.t3.micro, 20GB  (dev/test)
+                  medium = db.t3.medium, 100GB (staging)
+                  large  = db.r6g.large, 500GB (production)
+              version:
+                type: string
+                enum: ["13", "14", "15"]
+                default: "15"
+              backup:
+                type: boolean
+                default: true
+                description: Enable automated backups
+              multiAz:
+                type: boolean
+                default: false
+                description: Enable Multi-AZ deployment
+          status:
+            type: object
+            properties:
+              endpoint:
+                type: string
+              secretName:
+                type: string
+
+---
+# ── 2. Composition — Platform team defines what "small" means ─
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: postgresql-aws
+  labels:
+    provider: aws
+    environment: production
+spec:
+  compositeTypeRef:
+    apiVersion: platform.company.com/v1alpha1
+    kind: XPostgreSQLInstance
+
+  # Patch sets (reusable patch definitions)
+  patchSets:
+  - name: common-parameters
+    patches:
+    - type: FromCompositeFieldPath
+      fromFieldPath: metadata.labels
+      toFieldPath: metadata.labels
+
+  resources:
+  # Create the RDS instance
+  - name: rds-instance
+    base:
+      apiVersion: rds.aws.upbound.io/v1beta1
+      kind: Instance
+      spec:
+        forProvider:
+          region: us-east-1
+          engine: postgres
+          publiclyAccessible: false
+          skipFinalSnapshot: false
+          storageEncrypted: true
+          deletionProtection: true
+          enabledCloudwatchLogsExports:
+          - postgresql
+          - upgrade
+
+    patches:
+    # Map "size" enum to actual AWS instance class
+    - type: CombineFromComposite
+      combine:
+        variables:
+        - fromFieldPath: spec.size
+        strategy: string
+        string:
+          fmt: "%s"
+      toFieldPath: spec.forProvider.instanceClass
+      transforms:
+      - type: map
+        map:
+          small:  db.t3.micro
+          medium: db.t3.medium
+          large:  db.r6g.large
+
+    # Map "size" to storage allocation
+    - type: CombineFromComposite
+      combine:
+        variables:
+        - fromFieldPath: spec.size
+        strategy: string
+        string:
+          fmt: "%s"
+      toFieldPath: spec.forProvider.allocatedStorage
+      transforms:
+      - type: map
+        map:
+          small:  "20"
+          medium: "100"
+          large:  "500"
+
+    # Pass version
+    - type: FromCompositeFieldPath
+      fromFieldPath: spec.version
+      toFieldPath: spec.forProvider.engineVersion
+
+    # Pass backup setting
+    - type: FromCompositeFieldPath
+      fromFieldPath: spec.backup
+      toFieldPath: spec.forProvider.backupRetentionPeriod
+      transforms:
+      - type: convert
+        convert:
+          toType: string
+      - type: map
+        map:
+          "true":  "7"
+          "false": "0"
+
+    # Pass multi-AZ
+    - type: FromCompositeFieldPath
+      fromFieldPath: spec.multiAz
+      toFieldPath: spec.forProvider.multiAz
+
+  # Create the Secrets Manager secret to store credentials
+  - name: db-secret
+    base:
+      apiVersion: secretsmanager.aws.upbound.io/v1beta1
+      kind: Secret
+      spec:
+        forProvider:
+          region: us-east-1
+          recoveryWindowInDays: 7
+
+---
+# ── 3. Developer Usage (what developers actually create) ───────
+apiVersion: platform.company.com/v1alpha1
+kind: PostgreSQLInstance            # ClaimName: for namespace-scoped use
+metadata:
+  name: my-service-db
+  namespace: team-payments           # Developer's namespace
+spec:
+  size: medium                       # Platform defines what "medium" means
+  version: "15"
+  backup: true
+  multiAz: false                     # Not needed for staging
+  compositionSelector:
+    matchLabels:
+      provider: aws
+
+# Result: Crossplane creates:
+# - RDS instance with correct size/config
+# - Secrets Manager secret with credentials
+# - Populates status.endpoint and status.secretName
+# Developer gets: the database they need, configured correctly, no Terraform needed
+
+---
+# ── 4. S3 Bucket Composition ─────────────────────────────────
+# Developer: "I need an S3 bucket for storing uploads"
+apiVersion: platform.company.com/v1alpha1
+kind: ObjectStorageBucket
+metadata:
+  name: my-service-uploads
+  namespace: team-payments
+spec:
+  region: us-east-1
+  versioning: true
+  encryption: true
+  publicAccess: false
+  lifecycleRules:
+  - name: delete-old-files
+    enabled: true
+    expirationDays: 90
+
+# Platform creates:
+# - S3 bucket with correct security config
+# - S3 bucket policy
+# - KMS key for encryption
+# - IAM policy for access
+# - IRSA binding for the team's K8s service accounts

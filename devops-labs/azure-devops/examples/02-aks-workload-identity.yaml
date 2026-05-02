@@ -1,0 +1,128 @@
+# Example 02: AKS Workload Identity — Key Vault Integration
+# Grant pods access to Azure Key Vault without storing credentials
+
+---
+# Step 1: Create User-Assigned Managed Identity (Azure CLI)
+# az identity create --name myapp-identity --resource-group myRG
+
+# Step 2: Grant Key Vault access to the identity
+# IDENTITY_CLIENT_ID=$(az identity show --name myapp-identity --query clientId -o tsv)
+# IDENTITY_PRINCIPAL_ID=$(az identity show --name myapp-identity --query principalId -o tsv)
+# az keyvault set-policy --name my-keyvault \
+#   --object-id $IDENTITY_PRINCIPAL_ID \
+#   --secret-permissions get list
+
+# Step 3: Enable workload identity on AKS
+# az aks update --name myCluster --resource-group myRG \
+#   --enable-workload-identity --enable-oidc-issuer
+
+# Step 4: Get OIDC issuer URL
+# OIDC_ISSUER=$(az aks show --name myCluster --resource-group myRG \
+#   --query "oidcIssuerProfile.issuerUrl" -o tsv)
+
+# Step 5: Create federation credential
+# az identity federated-credential create \
+#   --name myapp-federated-cred \
+#   --identity-name myapp-identity \
+#   --resource-group myRG \
+#   --issuer $OIDC_ISSUER \
+#   --subject "system:serviceaccount:production:myapp-sa"
+
+---
+# Kubernetes ServiceAccount (annotated with Azure identity)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: myapp-sa
+  namespace: production
+  annotations:
+    azure.workload.identity/client-id: "CLIENT_ID_FROM_STEP_1"
+    azure.workload.identity/tenant-id: "YOUR_AZURE_TENANT_ID"
+automountServiceAccountToken: false
+
+---
+# SecretProviderClass — maps Key Vault secrets to K8s
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: myapp-secrets
+  namespace: production
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: "CLIENT_ID_FROM_STEP_1"
+    keyvaultName: "my-keyvault"
+    objects: |
+      array:
+        - |
+          objectName: db-password
+          objectType: secret
+          objectVersion: ""    # Empty = latest
+        - |
+          objectName: api-key
+          objectType: secret
+        - |
+          objectName: tls-cert
+          objectType: cert
+    tenantId: "YOUR_AZURE_TENANT_ID"
+  # Sync as K8s Secrets (optional — for tools that need K8s secrets)
+  secretObjects:
+  - secretName: myapp-k8s-secrets
+    type: Opaque
+    data:
+    - objectName: db-password
+      key: DB_PASSWORD
+    - objectName: api-key
+      key: API_KEY
+
+---
+# Deployment using Workload Identity + Key Vault secrets
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+      azure.workload.identity/use: "true"   # Required label
+  template:
+    metadata:
+      labels:
+        app: myapp
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: myapp-sa           # Uses our annotated SA
+
+      containers:
+      - name: app
+        image: myapp:latest
+        env:
+        # Reference the synced K8s secret
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: myapp-k8s-secrets
+              key: DB_PASSWORD
+        # Or mount as file
+        volumeMounts:
+        - name: secrets-store
+          mountPath: "/mnt/secrets"
+          readOnly: true
+
+      volumes:
+      - name: secrets-store
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: myapp-secrets
+
+---
+# Verify: pod should be able to list Key Vault secrets
+# kubectl exec -it myapp-pod -n production -- \
+#   curl -H "Authorization: Bearer $(cat /var/run/secrets/azure/tokens/azure-identity-token)" \
+#   "https://my-keyvault.vault.azure.net/secrets?api-version=7.3"

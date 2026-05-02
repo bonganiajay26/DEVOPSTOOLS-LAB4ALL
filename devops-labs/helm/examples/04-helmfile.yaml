@@ -1,0 +1,150 @@
+# Example 04: Helmfile — Declarative Multi-Chart Environment Management
+# Manages ALL Helm releases for a cluster in one file
+# Install: brew install helmfile
+# Usage:   helmfile sync | helmfile diff | helmfile apply
+
+repositories:
+- name: prometheus-community
+  url: https://prometheus-community.github.io/helm-charts
+- name: jetstack
+  url: https://charts.jetstack.io
+- name: argo
+  url: https://argoproj.github.io/argo-helm
+- name: bitnami
+  url: https://charts.bitnami.com/bitnami
+- name: ingress-nginx
+  url: https://kubernetes.github.io/ingress-nginx
+- name: external-secrets
+  url: https://charts.external-secrets.io
+- name: kedacore
+  url: https://kedacore.github.io/charts
+
+# ── Environment definitions ───────────────────────────────────
+environments:
+  staging:
+    values:
+    - environments/staging.yaml
+  production:
+    values:
+    - environments/production.yaml
+    secrets:
+    - secrets://environments/production-secrets.enc.yaml   # SOPS encrypted
+
+---
+# ── Platform Infrastructure (deploy first) ────────────────────
+releases:
+# Cert-manager: TLS certificate automation
+- name: cert-manager
+  namespace: cert-manager
+  chart: jetstack/cert-manager
+  version: "v1.14.0"
+  createNamespace: true
+  values:
+  - installCRDs: true
+  - replicaCount: 2
+  labels:
+    tier: platform
+    layer: "1"    # Deploy first
+
+# Ingress controller
+- name: ingress-nginx
+  namespace: ingress-nginx
+  chart: ingress-nginx/ingress-nginx
+  version: "4.9.1"
+  createNamespace: true
+  values:
+  - controller:
+      replicaCount: 2
+      service:
+        type: LoadBalancer
+      metrics:
+        enabled: true
+  needs:
+  - cert-manager/cert-manager    # Wait for cert-manager first
+  labels:
+    tier: platform
+    layer: "1"
+
+# External Secrets Operator
+- name: external-secrets
+  namespace: external-secrets
+  chart: external-secrets/external-secrets
+  version: "0.9.11"
+  createNamespace: true
+  labels:
+    tier: platform
+    layer: "1"
+
+# ── Monitoring (deploy second) ────────────────────────────────
+- name: monitoring
+  namespace: monitoring
+  chart: prometheus-community/kube-prometheus-stack
+  version: "58.0.0"
+  createNamespace: true
+  values:
+  - monitoring/values.yaml
+  - monitoring/values.{{ .Environment.Name }}.yaml  # env-specific overrides
+  needs:
+  - ingress-nginx/ingress-nginx
+  labels:
+    tier: monitoring
+    layer: "2"
+
+# ── Applications (deploy last) ────────────────────────────────
+- name: api-service
+  namespace: production
+  chart: oci://ghcr.io/myorg/charts/api-service
+  version: "2.3.1"
+  createNamespace: true
+  values:
+  - apps/api-service/values.yaml
+  - apps/api-service/values.{{ .Environment.Name }}.yaml
+  set:
+  - image.tag={{ requiredEnv "IMAGE_TAG" }}   # Must be set at deploy time
+  needs:
+  - monitoring/monitoring
+  - external-secrets/external-secrets
+  labels:
+    tier: application
+    layer: "3"
+
+- name: worker-service
+  namespace: production
+  chart: oci://ghcr.io/myorg/charts/worker-service
+  version: "2.3.1"
+  values:
+  - apps/worker-service/values.yaml
+  - apps/worker-service/values.{{ .Environment.Name }}.yaml
+  set:
+  - image.tag={{ requiredEnv "IMAGE_TAG" }}
+  needs:
+  - api-service
+  labels:
+    tier: application
+    layer: "3"
+
+# ── KEDA (event-driven autoscaling) ───────────────────────────
+- name: keda
+  namespace: keda
+  chart: kedacore/keda
+  version: "2.13.0"
+  createNamespace: true
+  labels:
+    tier: platform
+    layer: "2"
+
+# ── Usage commands ────────────────────────────────────────────
+# Preview all changes:
+# helmfile diff --environment production
+
+# Deploy everything in order:
+# IMAGE_TAG=abc1234 helmfile apply --environment production
+
+# Deploy only platform layer:
+# helmfile sync --selector tier=platform
+
+# Deploy only applications:
+# IMAGE_TAG=abc1234 helmfile sync --selector tier=application
+
+# Destroy everything (careful!):
+# helmfile destroy --environment staging

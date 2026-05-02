@@ -1,0 +1,109 @@
+# Example 03: Ansible Dynamic Inventory + AWS EC2
+
+# ── aws_ec2.yml — Dynamic inventory plugin ────────────────────
+# File: inventory/aws_ec2.yml
+# Usage: ansible-inventory -i inventory/aws_ec2.yml --list
+#        ansible-playbook -i inventory/aws_ec2.yml site.yml
+
+plugin: amazon.aws.aws_ec2
+
+# Which regions to query
+regions:
+- us-east-1
+- us-west-2
+
+# Filter: only running instances with specific tags
+filters:
+  instance-state-name: running
+  tag:Environment: production
+  tag:ManagedBy: ansible
+
+# Create groups from tags
+keyed_groups:
+- key: tags.Role
+  prefix: role              # Creates: role_webserver, role_database, role_worker
+
+- key: tags.Environment
+  prefix: env               # Creates: env_production, env_staging
+
+- key: instance_type
+  prefix: type              # Creates: type_m5_xlarge, etc.
+
+- key: placement.availability_zone
+  prefix: az                # Creates: az_us_east_1a, az_us_east_1b
+
+# Hostvars: what instance attributes to expose
+hostnames:
+- private-ip-address        # Use private IP (for VPN/bastion access)
+# - dns-name               # Use public DNS (if no VPN)
+# - tag:Name               # Use Name tag as hostname
+
+compose:
+  ansible_host: private_ip_address
+  ansible_user: "'ubuntu'"   # Default SSH user (adjust per OS)
+  node_name: tags.Name
+
+# Use assume role (for cross-account access)
+# assume_role_arn: "arn:aws:iam::123456789:role/ansible-role"
+
+---
+# ── group_vars/role_webserver.yml ────────────────────────────
+# Variables for all hosts in the role_webserver group
+http_port: 80
+nginx_version: "1.25"
+ssl_enabled: true
+app_user: www-data
+
+---
+# ── group_vars/role_database.yml ─────────────────────────────
+postgres_version: "15"
+postgres_max_connections: 200
+postgres_shared_buffers: "256MB"
+backup_enabled: true
+backup_bucket: "s3://my-db-backups"
+
+---
+# ── group_vars/env_production.yml ────────────────────────────
+environment: production
+log_level: warn
+monitoring_enabled: true
+alerting_enabled: true
+
+---
+# ── site.yml — Main playbook using dynamic inventory ─────────
+- name: Configure web servers
+  hosts: role_webserver        # Matches tag Role=webserver from AWS
+  become: true
+  roles:
+  - nginx
+  - app-deploy
+
+- name: Configure databases
+  hosts: role_database          # Matches tag Role=database from AWS
+  become: true
+  roles:
+  - postgresql
+  - backup-agent
+
+- name: Apply all — common baseline
+  hosts: all
+  become: true
+  roles:
+  - common                      # Baseline: hardening, monitoring agent, etc.
+
+---
+# ── Test dynamic inventory ────────────────────────────────────
+# List all hosts:
+# ansible-inventory -i inventory/aws_ec2.yml --list | python3 -m json.tool
+
+# List hosts in a specific group:
+# ansible-inventory -i inventory/aws_ec2.yml --graph role_webserver
+
+# Run ad-hoc on all production web servers:
+# ansible role_webserver -i inventory/aws_ec2.yml -m ping
+
+# Deploy only to specific AZ:
+# ansible-playbook site.yml -i inventory/aws_ec2.yml --limit az_us_east_1a
+
+# Deploy to all EXCEPT database group:
+# ansible-playbook site.yml -i inventory/aws_ec2.yml --limit 'all:!role_database'

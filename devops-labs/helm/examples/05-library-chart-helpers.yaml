@@ -1,0 +1,156 @@
+# Example 05: Complete _helpers.tpl — Standard Helm Template Helpers
+# File: templates/_helpers.tpl
+# These helpers are the foundation of every production Helm chart
+
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "myapp.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+We truncate at 63 chars because some Kubernetes name fields are limited.
+If release name contains chart name it will be used as a full name.
+*/}}
+{{- define "myapp.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "myapp.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels — applied to ALL resources
+*/}}
+{{- define "myapp.labels" -}}
+helm.sh/chart: {{ include "myapp.chart" . }}
+{{ include "myapp.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Selector labels — used in matchLabels (MUST be stable, never change after install)
+*/}}
+{{- define "myapp.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "myapp.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Create the name of the service account to use
+*/}}
+{{- define "myapp.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "myapp.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Return the image to use
+Usage: {{ include "myapp.image" . }}
+*/}}
+{{- define "myapp.image" -}}
+{{- $tag := .Values.image.tag | default .Chart.AppVersion }}
+{{- printf "%s:%s" .Values.image.repository $tag }}
+{{- end }}
+
+{{/*
+Return the image pull policy
+*/}}
+{{- define "myapp.imagePullPolicy" -}}
+{{- if .Values.image.tag }}
+{{- "IfNotPresent" }}
+{{- else }}
+{{- "Always" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Return the appropriate apiVersion for HorizontalPodAutoscaler
+*/}}
+{{- define "myapp.hpa.apiVersion" -}}
+{{- if .Capabilities.APIVersions.Has "autoscaling/v2" -}}
+autoscaling/v2
+{{- else -}}
+autoscaling/v2beta2
+{{- end -}}
+{{- end }}
+
+{{/*
+Return the appropriate apiVersion for Ingress
+*/}}
+{{- define "myapp.ingress.apiVersion" -}}
+{{- if .Capabilities.APIVersions.Has "networking.k8s.io/v1/Ingress" -}}
+networking.k8s.io/v1
+{{- else -}}
+networking.k8s.io/v1beta1
+{{- end -}}
+{{- end }}
+
+{{/*
+Compile all warnings into a single message and call fail.
+Usage: {{ include "myapp.validateValues" . }}
+*/}}
+{{- define "myapp.validateValues" -}}
+{{- $messages := list -}}
+{{- if not .Values.image.repository -}}
+  {{- $messages = append $messages "image.repository is required" -}}
+{{- end -}}
+{{- if .Values.ingress.enabled -}}
+  {{- if not .Values.ingress.hosts -}}
+    {{- $messages = append $messages "ingress.hosts must be set when ingress is enabled" -}}
+  {{- end -}}
+{{- end -}}
+{{- if gt (len $messages) 0 -}}
+  {{- printf "\nVALUES VALIDATION ERRORS:\n%s" (join "\n" $messages) | fail -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Generate a checksum annotation for ConfigMap/Secret — triggers rolling restart on change
+Usage: checksum/config: {{ include "myapp.configChecksum" . }}
+*/}}
+{{- define "myapp.configChecksum" -}}
+{{- include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+{{- end }}
+
+{{/*
+Return resource limits/requests with defaults
+*/}}
+{{- define "myapp.resources" -}}
+{{- if .Values.resources }}
+resources:
+  {{- toYaml .Values.resources | nindent 2 }}
+{{- else }}
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+{{- end }}
+{{- end }}

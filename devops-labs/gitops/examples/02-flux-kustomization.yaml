@@ -1,0 +1,161 @@
+# Example 02: Flux GitOps Configuration Patterns
+
+---
+# ── GitRepository: source of truth ───────────────────────────
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: gitops-repo
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/myorg/gitops-repo
+  ref:
+    branch: main
+  secretRef:
+    name: gitops-credentials   # SSH key or HTTPS token
+  # Ignore irrelevant paths (improves performance)
+  ignore: |
+    # exclude README and docs
+    /README.md
+    /docs/
+    /**/*.md
+
+---
+# ── Kustomization: apply apps ────────────────────────────────
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: production-apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: gitops-repo
+  path: ./apps/overlays/production
+  prune: true
+  wait: true
+  timeout: 5m
+  # Health checks (Flux waits for these before marking sync complete)
+  healthChecks:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+    namespace: production
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+    namespace: production
+  # Variable substitution from ConfigMap/Secret
+  postBuild:
+    substituteFrom:
+    - kind: ConfigMap
+      name: cluster-vars    # Contains: CLUSTER_NAME, REGION, etc.
+    - kind: Secret
+      name: cluster-secrets  # Contains: IMAGE_TAG, etc.
+  # Force reconcile even without source changes
+  force: false
+
+---
+# ── HelmRelease: install Helm chart via Flux ─────────────────
+apiVersion: helm.toolkit.fluxcd.io/v2beta2
+kind: HelmRelease
+metadata:
+  name: nginx-ingress
+  namespace: ingress-nginx
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: ingress-nginx
+      version: ">=4.9.0 <5.0.0"   # SemVer range
+      sourceRef:
+        kind: HelmRepository
+        name: ingress-nginx
+        namespace: flux-system
+  values:
+    controller:
+      replicaCount: 2
+      service:
+        type: LoadBalancer
+  # Upgrade options
+  upgrade:
+    remediation:
+      retries: 3
+      remediateLastFailure: true
+  # Rollback on failure
+  rollback:
+    timeout: 5m
+    cleanupOnFail: true
+
+---
+# ── HelmRepository: chart source ─────────────────────────────
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: ingress-nginx
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://kubernetes.github.io/ingress-nginx
+
+---
+# ── ImageUpdateAutomation: auto-commit new image tags ─────────
+apiVersion: image.toolkit.fluxcd.io/v1beta1
+kind: ImageUpdateAutomation
+metadata:
+  name: image-updater
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: gitops-repo
+  git:
+    commit:
+      author:
+        email: fluxcdbot@company.com
+        name: FluxCD Bot
+      messageTemplate: |
+        chore(images): update {{range .Updated.Images}}{{.}}{{end}}
+
+        Updated by FluxCD ImageUpdateAutomation
+        Run ID: {{.AutomationRunID}}
+    push:
+      branch: main
+  update:
+    path: ./apps
+    strategy: Setters         # Updates # {"$imagepolicy": "..."} markers
+
+---
+# ── Notification: Slack alerts ────────────────────────────────
+apiVersion: notification.toolkit.fluxcd.io/v1beta3
+kind: Provider
+metadata:
+  name: slack-production
+  namespace: flux-system
+spec:
+  type: slack
+  channel: '#deployments'
+  secretRef:
+    name: slack-webhook-url
+
+---
+apiVersion: notification.toolkit.fluxcd.io/v1beta3
+kind: Alert
+metadata:
+  name: production-alerts
+  namespace: flux-system
+spec:
+  providerRef:
+    name: slack-production
+  eventSeverity: info
+  eventSources:
+  - kind: Kustomization
+    namespace: flux-system
+    name: '*'
+  - kind: HelmRelease
+    namespace: '*'
+    name: '*'
+  summary: "Production cluster sync event"
