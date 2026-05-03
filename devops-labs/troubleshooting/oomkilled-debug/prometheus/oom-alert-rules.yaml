@@ -1,0 +1,174 @@
+# OOM Alerting Rules
+# Apply: kubectl apply -f oom-alert-rules.yaml
+# Requires: kube-prometheus-stack (Prometheus Operator)
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: oom-memory-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack    # Must match your Prometheus Operator selector
+    team: platform
+spec:
+  groups:
+
+  # ── Early-warning alerts (fires BEFORE OOMKill) ─────────────
+  - name: memory-pressure-early-warning
+    rules:
+
+    # Alert when container is at 80% of its memory limit
+    # (This is your window to act before it crashes)
+    - alert: ContainerMemoryHighUsage
+      expr: |
+        (
+          container_memory_working_set_bytes{container!="", container!="POD"}
+          /
+          container_spec_memory_limit_bytes{container!="", container!="POD"}
+        ) > 0.80
+      for: 5m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "Container {{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} at {{ $value | humanizePercentage }} memory"
+        description: |
+          Container is using {{ $value | humanizePercentage }} of its memory limit.
+          Working set: {{ with printf "container_memory_working_set_bytes{container='%s',pod='%s',namespace='%s'}" .Labels.container .Labels.pod .Labels.namespace | query }}{{ . | first | value | humanize1024 }}B{{ end }}
+          Limit: {{ with printf "container_spec_memory_limit_bytes{container='%s',pod='%s',namespace='%s'}" .Labels.container .Labels.pod .Labels.namespace | query }}{{ . | first | value | humanize1024 }}B{{ end }}
+          At this rate an OOMKill will occur within minutes.
+        runbook: https://wiki.company.com/runbooks/oom-killed
+        action: |
+          Immediate: kubectl set resources deployment/<name> --limits=memory=<new-limit>
+          Long-term:  Run VPA recommendations (see runbook)
+
+    # Critical threshold - OOMKill nearly certain
+    - alert: ContainerMemoryCritical
+      expr: |
+        (
+          container_memory_working_set_bytes{container!="", container!="POD"}
+          /
+          container_spec_memory_limit_bytes{container!="", container!="POD"}
+        ) > 0.95
+      for: 2m
+      labels:
+        severity: critical
+        team: platform
+        page: "true"
+      annotations:
+        summary: "CRITICAL: {{ $labels.namespace }}/{{ $labels.pod }} at 95% memory — OOMKill imminent"
+        description: "Container {{ $labels.container }} is at {{ $value | humanizePercentage }} of limit. Immediate action required."
+        runbook: https://wiki.company.com/runbooks/oom-killed
+
+  # ── OOMKill detection (fires AFTER the kill) ─────────────────
+  - name: oomkill-detection
+    rules:
+
+    # Detect OOMKill by correlating restart events with OOMKilled reason
+    - alert: ContainerOOMKilled
+      expr: |
+        kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+      for: 0m    # Fire immediately — no wait
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "OOMKill: {{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }}"
+        description: |
+          Container was OOMKilled. Memory limit was too low or there is a memory leak.
+          Run: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+          Then: kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous
+        runbook: https://wiki.company.com/runbooks/oom-killed
+
+    # Repeated OOMKills (indicates unaddressed recurring issue)
+    - alert: ContainerRepeatedOOMKills
+      expr: |
+        increase(kube_pod_container_status_restarts_total[1h])
+          * on(pod, namespace, container)
+          kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}
+          > 3
+      for: 0m
+      labels:
+        severity: critical
+        team: platform
+        page: "true"
+      annotations:
+        summary: "Repeated OOMKills: {{ $labels.namespace }}/{{ $labels.pod }} crashed {{ $value }} times in 1h"
+        description: "Container {{ $labels.container }} has been OOMKilled {{ $value }} times in the last hour. Immediate investigation required."
+
+  # ── Memory leak detection ─────────────────────────────────────
+  - name: memory-leak-detection
+    rules:
+
+    # Detect steady memory growth (> 10MB/hour = probable leak)
+    - alert: ContainerMemoryLeakSuspected
+      expr: |
+        (
+          deriv(container_memory_working_set_bytes{container!="", container!="POD"}[30m])
+          * 3600                    # bytes/sec → bytes/hour
+          / (1024 * 1024)           # → MB/hour
+        ) > 10
+      for: 30m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "Memory leak suspected: {{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} growing {{ $value | humanize }}MB/hour"
+        description: |
+          Container memory is growing at {{ $value | humanize }}MB/hour — possible memory leak.
+          This container will OOMKill if the trend continues.
+          Action: Profile the application for memory leaks.
+        runbook: https://wiki.company.com/runbooks/memory-leak
+
+  # ── Node-level memory pressure ────────────────────────────────
+  - name: node-memory-pressure
+    rules:
+
+    - alert: NodeMemoryPressureHigh
+      expr: |
+        (
+          node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+        ) / node_memory_MemTotal_bytes > 0.85
+      for: 10m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "Node {{ $labels.instance }} memory > 85%"
+        description: "High node memory may cause pod evictions and OOMKills across multiple pods."
+
+    # Predict node memory exhaustion
+    - alert: NodeMemoryWillExhaust
+      expr: |
+        predict_linear(node_memory_MemAvailable_bytes[2h], 4 * 3600) < 0
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Node {{ $labels.instance }} memory will exhaust in < 4 hours"
+        description: "Based on current trend, node memory will run out in ~4 hours. Scale up or reduce workloads."
+
+  # ── Recording rules (pre-computed for dashboard performance) ──
+  - name: memory-recording-rules
+    interval: 1m
+    rules:
+
+    # Memory usage percentage per container
+    - record: namespace_container:memory_usage_percent
+      expr: |
+        container_memory_working_set_bytes{container!="", container!="POD"}
+        / container_spec_memory_limit_bytes{container!="", container!="POD"}
+        * 100
+
+    # Top 10 memory consumers per namespace
+    - record: namespace:container_memory_working_set_bytes:topk10
+      expr: |
+        topk(10,
+          sum(container_memory_working_set_bytes{container!="", container!="POD"})
+          by (namespace, pod, container)
+        )
+
+    # Memory growth rate per container (MB/hour)
+    - record: container:memory_growth_rate_mb_per_hour
+      expr: |
+        deriv(container_memory_working_set_bytes{container!=""}[30m]) * 3600 / (1024*1024)

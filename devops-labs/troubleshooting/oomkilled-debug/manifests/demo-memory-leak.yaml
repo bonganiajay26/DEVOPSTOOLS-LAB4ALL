@@ -1,0 +1,189 @@
+# ============================================================
+# Demo: Intentional Memory Leak + OOMKill
+# Deploys the Python app from demo-app/ with a low memory limit
+# so you can practice the full diagnosis workflow
+#
+# Deploy:  kubectl apply -f demo-memory-leak.yaml
+# Trigger: curl http://localhost:8080/leak?mb=10   (allocate 10MB)
+# Watch:   kubectl get pods -l app=memory-leak-demo -w
+# Debug:   bash ../scripts/01-diagnose.sh <pod-name> oom-demo
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oom-demo
+  labels:
+    goldilocks.fairwinds.com/enabled: "true"   # Enable Goldilocks recommendations
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-leak-demo
+  namespace: oom-demo
+  labels:
+    app: memory-leak-demo
+    demo: oomkill
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-leak-demo
+  template:
+    metadata:
+      labels:
+        app: memory-leak-demo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: leaky-app
+        image: python:3.12-slim
+        ports:
+        - containerPort: 8080
+          name: http
+
+        # ─── Intentionally LOW limit so OOMKill triggers easily ───
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"    # Only 128Mi — easy to exceed
+
+        # Bootstrap the app inline (no registry needed)
+        command: ["python3", "-c"]
+        args:
+        - |
+          import http.server, threading, time, os, gc
+          from urllib.parse import urlparse, parse_qs
+
+          # Global list to hold leaked memory (never freed)
+          LEAKED = []
+          ALLOCATED_MB = 0
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  global LEAKED, ALLOCATED_MB
+                  parsed = urlparse(self.path)
+                  params = parse_qs(parsed.query)
+
+                  if parsed.path == '/health':
+                      body = b'{"status":"ok"}'
+                      self.send_response(200)
+
+                  elif parsed.path == '/leak':
+                      # Allocate N MB and HOLD it (never free → leak simulation)
+                      mb = int(params.get('mb', ['10'])[0])
+                      data = bytearray(mb * 1024 * 1024)
+                      LEAKED.append(data)
+                      ALLOCATED_MB += mb
+                      body = f'{{"allocated_mb":{mb},"total_leaked_mb":{ALLOCATED_MB}}}'.encode()
+                      self.send_response(200)
+                      print(f"Leaked {mb}MB | Total leaked: {ALLOCATED_MB}MB")
+
+                  elif parsed.path == '/status':
+                      import resource
+                      usage = resource.getrusage(resource.RUSAGE_SELF)
+                      rss_mb = usage.ru_maxrss / 1024  # KB → MB on Linux
+                      body = f'{{"rss_mb":{rss_mb:.1f},"leaked_chunks":{len(LEAKED)},"total_leaked_mb":{ALLOCATED_MB}}}'.encode()
+                      self.send_response(200)
+
+                  elif parsed.path == '/metrics':
+                      import resource
+                      usage = resource.getrusage(resource.RUSAGE_SELF)
+                      rss = usage.ru_maxrss * 1024  # to bytes
+                      body = f"""# HELP process_resident_memory_bytes RSS memory in bytes
+          # TYPE process_resident_memory_bytes gauge
+          process_resident_memory_bytes {rss}
+          # HELP demo_leaked_bytes Total intentionally leaked bytes
+          # TYPE demo_leaked_bytes gauge
+          demo_leaked_bytes {ALLOCATED_MB * 1024 * 1024}
+          """.encode()
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'text/plain')
+                      self.end_headers()
+                      self.wfile.write(body)
+                      return
+
+                  elif parsed.path == '/free':
+                      freed = ALLOCATED_MB
+                      LEAKED.clear()
+                      gc.collect()
+                      ALLOCATED_MB = 0
+                      body = f'{{"freed_mb":{freed},"status":"memory_freed"}}'.encode()
+                      self.send_response(200)
+
+                  else:
+                      body = b'{"endpoints":["/health","/leak?mb=10","/status","/metrics","/free"]}'
+                      self.send_response(200)
+
+                  self.send_header('Content-Type', 'application/json')
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, fmt, *args):
+                  pass   # Suppress access logs
+
+          print("Memory leak demo server starting on :8080")
+          print("Endpoints: /leak?mb=10  /status  /free  /metrics")
+          server = http.server.HTTPServer(('', 8080), Handler)
+          server.serve_forever()
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-leak-demo
+  namespace: oom-demo
+spec:
+  selector:
+    app: memory-leak-demo
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+
+---
+# VPA in recommendation mode (won't change limits automatically)
+# After running for 30+ minutes, check:
+#   kubectl describe vpa memory-leak-demo -n oom-demo
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: memory-leak-demo
+  namespace: oom-demo
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: memory-leak-demo
+  updatePolicy:
+    updateMode: "Off"     # Recommendation only — won't auto-restart pods
+  resourcePolicy:
+    containerPolicies:
+    - containerName: leaky-app
+      minAllowed:
+        memory: "64Mi"
+      maxAllowed:
+        memory: "1Gi"
+      controlledResources: ["memory", "cpu"]

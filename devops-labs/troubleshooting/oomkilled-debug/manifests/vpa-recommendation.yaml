@@ -1,0 +1,113 @@
+# VPA objects for common workload types
+# Mode: "Off" = recommendation only (safe for production, no restarts)
+
+---
+# ── Generic application VPA (recommendation mode) ────────────
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: myapp-vpa
+  namespace: production
+  annotations:
+    description: "VPA in recommendation mode — check recommendations with: kubectl describe vpa myapp-vpa"
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp              # ← change to your deployment name
+  updatePolicy:
+    updateMode: "Off"        # SAFE: only recommends, doesn't restart pods
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"     # Apply to all containers
+      minAllowed:
+        cpu: "50m"
+        memory: "64Mi"
+      maxAllowed:
+        cpu: "8"
+        memory: "8Gi"
+      controlledResources: ["cpu", "memory"]
+      # Which resource to control (both by default)
+      controlledValues: RequestsAndLimits
+
+---
+# ── VPA in Auto mode (for stateless workloads ONLY) ──────────
+# WARNING: Auto mode WILL restart pods to apply recommendations.
+# Only use for stateless, horizontally-scalable workloads.
+# NEVER use for databases or stateful applications.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: myapp-vpa-auto
+  namespace: production
+  annotations:
+    description: "VPA Auto mode — WILL restart pods. Use only for stateless workloads."
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp-stateless    # ← stateless deployment only
+  updatePolicy:
+    updateMode: "Auto"
+    # Minimum replicas: VPA won't evict the last pod
+    minReplicas: 2
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: "100m"
+        memory: "128Mi"
+      maxAllowed:
+        cpu: "4"
+        memory: "4Gi"
+
+---
+# ── Java/JVM application VPA (higher memory bounds) ──────────
+# JVM apps have large heap requirements. Set appropriate bounds.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: java-app-vpa
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: java-service
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: java-service
+      minAllowed:
+        memory: "512Mi"      # JVM needs at least 512Mi
+      maxAllowed:
+        memory: "16Gi"
+      controlledResources: ["memory"]
+      # VPA recommendation note for JVM:
+      # Set -Xmx to 70% of the VPA-recommended memory limit
+      # Example: if VPA recommends 2Gi limit, set -Xmx=1400m
+
+---
+# ── Check recommendations ─────────────────────────────────────
+# kubectl describe vpa myapp-vpa -n production
+#
+# Output:
+#   Recommendation:
+#     Container Recommendations:
+#       Container Name:  myapp
+#       Lower Bound:
+#         Cpu:     45m        ← never go below this
+#         Memory:  112Mi
+#       Target:
+#         Cpu:     120m       ← optimal value (set as request)
+#         Memory:  256Mi
+#       Uncapped Target:
+#         Cpu:     120m
+#         Memory:  256Mi
+#       Upper Bound:
+#         Cpu:     500m       ← never exceed this (set as limit)
+#         Memory:  512Mi      ← set this as your limit + 20% headroom
+#
+# Apply target + 20% headroom as the new limit:
+#   bash ../scripts/04-rightsize.sh myapp production

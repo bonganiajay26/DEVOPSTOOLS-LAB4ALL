@@ -1,0 +1,212 @@
+{
+  "title": "OOMKill Investigator",
+  "uid": "oomkill-investigator",
+  "tags": ["memory", "oomkill", "troubleshooting"],
+  "description": "Diagnose OOMKilled containers — memory trends, leak detection, right-sizing",
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus"
+      },
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": "label_values(kube_pod_info, namespace)",
+        "current": { "value": "production" }
+      },
+      {
+        "name": "pod",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": "label_values(container_memory_working_set_bytes{namespace=\"$namespace\"}, pod)",
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "container",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": "label_values(container_memory_working_set_bytes{namespace=\"$namespace\",pod=~\"$pod\"}, container)",
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Memory Usage vs Limit (%)",
+      "description": "Anything above 80% is in the danger zone. Above 100% = OOMKilled.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 0 },
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "(container_memory_working_set_bytes{namespace=\"$namespace\",pod=~\"$pod\",container=~\"$container\",container!=\"POD\"} / container_spec_memory_limit_bytes{namespace=\"$namespace\",pod=~\"$pod\",container=~\"$container\"}) * 100",
+          "legendFormat": "{{pod}} / {{container}}"
+        },
+        {
+          "expr": "vector(80)",
+          "legendFormat": "80% warning threshold"
+        },
+        {
+          "expr": "vector(100)",
+          "legendFormat": "100% OOMKill threshold"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "orange", "value": 85 },
+              { "color": "red",    "value": 95 }
+            ]
+          },
+          "custom": { "fillOpacity": 15 }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "OOMKill Events",
+      "description": "Each spike = one OOMKill event",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "increase(kube_pod_container_status_restarts_total{namespace=\"$namespace\",pod=~\"$pod\"}[5m])",
+          "legendFormat": "{{pod}} restarts"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "red", "mode": "fixed" },
+          "custom": { "fillOpacity": 40, "drawStyle": "bars" }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Absolute Memory Usage (Working Set)",
+      "description": "Raw bytes. Compare to limit to understand headroom.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "container_memory_working_set_bytes{namespace=\"$namespace\",pod=~\"$pod\",container=~\"$container\",container!=\"POD\"}",
+          "legendFormat": "Used: {{pod}}/{{container}}"
+        },
+        {
+          "expr": "container_spec_memory_limit_bytes{namespace=\"$namespace\",pod=~\"$pod\",container=~\"$container\",container!=\"POD\"}",
+          "legendFormat": "Limit: {{pod}}/{{container}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Memory Growth Rate (Leak Detector)",
+      "description": "Positive slope = memory growing. > 10MB/h = suspected leak.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "deriv(container_memory_working_set_bytes{namespace=\"$namespace\",pod=~\"$pod\",container=~\"$container\",container!=\"POD\"}[30m]) * 3600 / (1024*1024)",
+          "legendFormat": "Growth rate: {{pod}}/{{container}}"
+        },
+        {
+          "expr": "vector(10)",
+          "legendFormat": "Leak threshold (10 MB/h)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "MBs",
+          "thresholds": {
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 2 },
+              { "color": "red",    "value": 10 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Top Memory Consumers (namespace)",
+      "description": "Which pods are eating the most memory right now",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "topk(10, sum(container_memory_working_set_bytes{namespace=\"$namespace\",container!=\"\",container!=\"POD\"}) by (pod))",
+          "legendFormat": "{{pod}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": { "mode": "spectrum" }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Containers Near OOM (> 75% of limit)",
+      "description": "All containers that need attention RIGHT NOW",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "(container_memory_working_set_bytes{namespace=\"$namespace\",container!=\"\",container!=\"POD\"} / container_spec_memory_limit_bytes{namespace=\"$namespace\",container!=\"\",container!=\"POD\"} * 100) > 75",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        { "id": "filterByValue",
+          "options": {
+            "filters": [{ "fieldName": "Value", "config": { "id": "greater", "options": { "value": 75 } } }]
+          }
+        },
+        { "id": "organize",
+          "options": {
+            "renameByName": { "Value": "Usage (%)", "namespace": "Namespace", "pod": "Pod", "container": "Container" }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "overrides": [{
+          "matcher": { "id": "byName", "options": "Usage (%)" },
+          "properties": [{
+            "id": "custom.displayMode", "value": "color-background"
+          }, {
+            "id": "thresholds",
+            "value": { "steps": [
+              { "color": "yellow", "value": 75 },
+              { "color": "orange", "value": 85 },
+              { "color": "red",    "value": 95 }
+            ]}
+          }]
+        }]
+      }
+    }
+  ]
+}
