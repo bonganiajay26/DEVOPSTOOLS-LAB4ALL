@@ -1,0 +1,344 @@
+# Full Pre-Production Gate Pipeline
+# Goal: catch 95% of issues before production
+#
+# Gates in sequence (each must pass to proceed):
+#   1. SAST        — static code security analysis
+#   2. Unit Tests  — fast feedback, code correctness
+#   3. DAST        — dynamic security scan against staging
+#   4. Integration — end-to-end API tests against staging
+#   5. Performance — p99 latency + error rate baseline check
+#   6. Chaos       — kill pods in staging, verify resilience
+#
+# Deploy to production only after ALL gates pass.
+
+name: Pre-Production Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/myapp
+  STAGING_URL: https://staging.company.com
+  REGISTRY: ghcr.io
+
+jobs:
+
+  # ── Gate 1: SAST ──────────────────────────────────────────────
+  sast:
+    name: "Gate 1: SAST"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+
+    # CodeQL — deep semantic analysis
+    - uses: github/codeql-action/init@v3
+      with:
+        languages: python
+        queries: security-extended
+
+    - uses: github/codeql-action/autobuild@v3
+    - uses: github/codeql-action/analyze@v3
+      with:
+        output: codeql-results.sarif
+
+    # Semgrep — fast pattern-based rules (catches OWASP Top 10)
+    - uses: returntocorp/semgrep-action@v1
+      with:
+        config: >-
+          p/python
+          p/flask
+          p/sql-injection
+          p/xss
+          p/secrets
+        auditOn: push
+
+    # Bandit — Python-specific security linter
+    - run: |
+        pip install bandit
+        bandit -r src/ -f json -o bandit-report.json \
+          --severity-level medium || true
+        python3 -c "
+        import json
+        with open('bandit-report.json') as f:
+            report = json.load(f)
+        high = [i for i in report['results'] if i['issue_severity'] == 'HIGH']
+        if high:
+            print(f'FAIL: {len(high)} HIGH severity issues found')
+            for issue in high:
+                print(f'  {issue[\"filename\"]}:{issue[\"line_number\"]}: {issue[\"issue_text\"]}')
+            exit(1)
+        print(f'PASS: 0 HIGH severity issues')
+        "
+
+  # ── Gate 2: Unit Tests ────────────────────────────────────────
+  unit-tests:
+    name: "Gate 2: Unit Tests"
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: pip
+    - run: pip install -r requirements.txt -r requirements-dev.txt
+    - run: |
+        pytest tests/unit/ \
+          -v \
+          --cov=src \
+          --cov-fail-under=80 \
+          --cov-report=xml \
+          --junitxml=test-results.xml
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: unit-test-results
+        path: test-results.xml
+
+  # ── Build image (needed for DAST, integration, perf gates) ───
+  build:
+    name: Build Image
+    needs: [sast, unit-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
+    - uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.IMAGE }}
+        tags: type=sha,format=short
+    - uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: production
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # ── Deploy to staging ─────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Deploy to staging
+      env:
+        IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+      run: |
+        # Deploy to staging (your actual deploy command here)
+        kubectl set image deployment/myapp \
+          app=${{ env.IMAGE }}:$IMAGE_TAG \
+          -n staging
+        kubectl rollout status deployment/myapp -n staging --timeout=5m
+        sleep 30    # Allow traffic to warm up before running tests
+
+  # ── Gate 3: DAST ──────────────────────────────────────────────
+  dast:
+    name: "Gate 3: DAST (OWASP ZAP)"
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # Full ZAP scan against staging
+    - name: ZAP Full Scan
+      uses: zaproxy/action-full-scan@v0.10.0
+      with:
+        target: ${{ env.STAGING_URL }}
+        rules_file_name: .zap/rules.tsv
+        cmd_options: "-a"    # Ajax Spider (for SPAs)
+        fail_action: false   # Don't fail here — report and continue
+        allow_issue_writing: true
+
+    - name: Fail on CRITICAL findings
+      run: |
+        # Parse ZAP report and fail on CRITICAL/HIGH findings
+        if [ -f report_json.json ]; then
+          python3 << 'PYEOF'
+import json
+with open('report_json.json') as f:
+    report = json.load(f)
+
+critical = [a for site in report.get('site', [])
+            for a in site.get('alerts', [])
+            if a.get('riskcode', '0') == '3']   # riskcode 3 = High
+
+if critical:
+    print(f"FAIL: {len(critical)} HIGH/CRITICAL vulnerabilities found:")
+    for a in critical:
+        print(f"  [{a['riskdesc']}] {a['name']}: {a['desc'][:100]}")
+    exit(1)
+print("PASS: No critical vulnerabilities found")
+PYEOF
+        fi
+
+  # ── Gate 4: Integration Tests ─────────────────────────────────
+  integration-tests:
+    name: "Gate 4: Integration Tests"
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: pip
+    - run: pip install pytest requests
+    - name: Run integration tests
+      env:
+        BASE_URL: ${{ env.STAGING_URL }}
+      run: |
+        pytest tests/integration/ \
+          -v \
+          --junitxml=integration-results.xml \
+          --tb=short
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: integration-test-results
+        path: integration-results.xml
+
+  # ── Gate 5: Performance Baseline ─────────────────────────────
+  performance:
+    name: "Gate 5: Performance Baseline (k6)"
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run k6 performance test
+      uses: grafana/k6-action@v0.3.1
+      with:
+        filename: pre-prod-gates/k6/performance-baseline.js
+        flags: --out json=k6-results.json
+      env:
+        BASE_URL: ${{ env.STAGING_URL }}
+        K6_VUS: 50              # 50 virtual users
+        K6_DURATION: 2m         # 2 minute test
+
+    - name: Validate performance thresholds
+      run: |
+        python3 << 'PYEOF'
+import json
+
+results = {}
+with open('k6-results.json') as f:
+    for line in f:
+        obj = json.loads(line)
+        if obj.get('type') == 'Point':
+            metric = obj['metric']
+            value  = obj['data']['value']
+            if metric not in results:
+                results[metric] = []
+            results[metric].append(value)
+
+# Calculate p99 latency
+latencies = sorted(results.get('http_req_duration', []))
+if latencies:
+    p99 = latencies[int(len(latencies) * 0.99)]
+    error_rate = sum(1 for v in results.get('http_req_failed', []) if v) / max(len(results.get('http_req_failed', [1])), 1)
+
+    print(f"p99 latency: {p99:.0f}ms (threshold: 500ms)")
+    print(f"Error rate:  {error_rate:.2%}  (threshold: 1%)")
+
+    failed = []
+    if p99 > 500:
+        failed.append(f"p99 latency {p99:.0f}ms exceeds 500ms threshold")
+    if error_rate > 0.01:
+        failed.append(f"Error rate {error_rate:.2%} exceeds 1% threshold")
+
+    if failed:
+        print("FAIL:")
+        for f in failed:
+            print(f"  - {f}")
+        exit(1)
+    print("PASS: All performance thresholds met")
+PYEOF
+
+  # ── Gate 6: Chaos in Staging ──────────────────────────────────
+  chaos:
+    name: "Gate 6: Chaos Resilience (staging)"
+    needs: [integration-tests, performance]
+    if: github.ref == 'refs/heads/main'  # Only on main, not PRs
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run chaos experiment
+      run: |
+        # Kill 50% of staging pods while running health checks
+        kubectl apply -f pre-prod-gates/chaos/staging-chaos.yaml -n staging
+        sleep 60   # Allow experiment to run for 60 seconds
+
+        # Verify service stayed available during chaos
+        ERRORS=0
+        for i in $(seq 1 30); do
+          STATUS=$(curl -sf --max-time 5 ${{ env.STAGING_URL }}/health \
+            -o /dev/null -w "%{http_code}" || echo "000")
+          if [ "$STATUS" != "200" ]; then
+            ERRORS=$((ERRORS + 1))
+            echo "Health check $i: FAILED ($STATUS)"
+          else
+            echo "Health check $i: OK"
+          fi
+          sleep 2
+        done
+
+        # Cleanup chaos
+        kubectl delete -f pre-prod-gates/chaos/staging-chaos.yaml -n staging 2>/dev/null || true
+
+        # Fail if > 10% of health checks failed during chaos
+        if [ $ERRORS -gt 3 ]; then
+          echo "FAIL: $ERRORS/30 health checks failed during chaos experiment"
+          exit 1
+        fi
+        echo "PASS: Service remained available during pod kill experiment"
+
+  # ── Deploy to Production (all gates must pass) ────────────────
+  deploy-production:
+    name: "Deploy to Production"
+    needs: [sast, unit-tests, dast, integration-tests, performance, chaos]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://api.company.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: All gates passed — deploying to production
+      env:
+        IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+      run: |
+        echo "==================================="
+        echo "ALL PRE-PROD GATES PASSED"
+        echo "Gates: SAST ✅ Unit ✅ DAST ✅ Integration ✅ Perf ✅ Chaos ✅"
+        echo "Image: ${{ env.IMAGE }}:$IMAGE_TAG"
+        echo "==================================="
+
+        # Deploy via Argo Rollouts (canary strategy handles traffic splitting)
+        kubectl argo rollouts set image myapp \
+          app=${{ env.IMAGE }}:$IMAGE_TAG \
+          -n production
+
+        echo "Canary deployment started."
+        echo "Monitor at: https://argo.company.com/rollouts/myapp"
+        echo "Argo Rollouts will auto-rollback if health gates fail."

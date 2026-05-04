@@ -1,0 +1,201 @@
+# Argo Rollouts — Canary with Automated Prometheus Health Gates
+#
+# Install Argo Rollouts first:
+#   bash install.sh
+#
+# This replaces kubectl Deployment with a Rollout resource.
+# The canary strategy:
+#   1%  → pause → check Prometheus metrics (2 min)
+#   10% → pause → check metrics (5 min)
+#   25% → pause → check metrics (5 min)
+#   50% → pause → check metrics (5 min)
+#   100% → full rollout
+#
+# If ANY health gate fails → automatic rollback to previous version
+#
+# Apply:
+#   kubectl apply -f rollout-canary.yaml -n production
+#   kubectl apply -f analysis-template.yaml -n production
+#
+# Deploy new version:
+#   kubectl argo rollouts set image myapp app=myapp:v2.4.0 -n production
+#   kubectl argo rollouts get rollout myapp --watch -n production
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: myapp
+  namespace: production
+  labels:
+    app: myapp
+spec:
+  replicas: 10
+  revisionHistoryLimit: 3
+
+  selector:
+    matchLabels:
+      app: myapp
+
+  template:
+    metadata:
+      labels:
+        app: myapp
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: app
+        image: myregistry.io/myapp:v2.3.0    # Updated by CI: kubectl argo rollouts set image
+        ports:
+        - containerPort: 8080
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 10"]
+      terminationGracePeriodSeconds: 30
+
+  strategy:
+    canary:
+      # ── Traffic routing (use stable/canary services) ──────────
+      stableService: myapp-stable
+      canaryService: myapp-canary
+
+      # ── Traffic split via ingress weights ─────────────────────
+      trafficRouting:
+        nginx:
+          stableIngress: myapp-stable-ingress
+
+      # ── Analysis: run health checks between every step ────────
+      analysis:
+        templates:
+        - templateName: myapp-health-check
+        startingStep: 1     # Start analysis from step 1 (1% canary)
+        args:
+        - name: service-name
+          value: myapp-canary
+        - name: namespace
+          value: production
+
+      # ── Canary steps ──────────────────────────────────────────
+      steps:
+      # Step 1: 1% canary — confirm basic health
+      - setWeight: 1
+      - pause:
+          duration: 2m       # 2 min at 1% — quick sanity check
+      - analysis:
+          templates:
+          - templateName: myapp-health-check
+          args:
+          - name: threshold-error-rate
+            value: "0.05"    # Max 5% errors at canary step
+
+      # Step 2: 10% canary — real traffic sample
+      - setWeight: 10
+      - pause:
+          duration: 5m       # 5 min at 10%
+      - analysis:
+          templates:
+          - templateName: myapp-health-check
+          args:
+          - name: threshold-error-rate
+            value: "0.02"    # Tighter threshold now
+
+      # Step 3: 25% canary — significant traffic
+      - setWeight: 25
+      - pause:
+          duration: 5m
+      - analysis:
+          templates:
+          - templateName: myapp-health-check
+          args:
+          - name: threshold-error-rate
+            value: "0.01"    # Very tight at 25%
+
+      # Step 4: 50% canary — manual approval gate
+      - setWeight: 50
+      - pause: {}            # {} = wait indefinitely for manual approval
+      # To approve:   kubectl argo rollouts promote myapp -n production
+      # To rollback:  kubectl argo rollouts abort myapp -n production
+
+      # Step 5: 100% — full rollout
+      - setWeight: 100
+
+      # ── Rollback settings ─────────────────────────────────────
+      antiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution: {}   # Spread across nodes
+
+---
+# ── Stable service (majority of traffic) ─────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-stable
+  namespace: production
+spec:
+  selector:
+    app: myapp
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+
+---
+# ── Canary service (new version traffic) ─────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-canary
+  namespace: production
+spec:
+  selector:
+    app: myapp
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+
+---
+# ── Ingress with canary weight annotation ─────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-stable-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    # Argo Rollouts manages the canary-weight annotation during rollout
+spec:
+  rules:
+  - host: api.company.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: myapp-stable
+            port:
+              number: 80

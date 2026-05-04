@@ -1,0 +1,288 @@
+{
+  "title": "Deployment Health — Is This Deploy Safe?",
+  "uid": "deploy-health",
+  "description": "Real-time view of deployment health. Used during canary and blue/green promotions to decide: promote or rollback.",
+  "tags": ["deployment", "canary", "rollback", "slo"],
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(kube_deployment_labels, namespace)",
+        "current": { "value": "production" }
+      },
+      {
+        "name": "deployment",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(kube_deployment_labels{namespace=\"$namespace\"}, deployment)",
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "DEPLOY STATUS",
+      "description": "GREEN = healthy deploy. RED = rollback immediately.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "(sum(rate(http_requests_total{namespace=\"$namespace\",status=~\"2..|3..\"}[2m])) / sum(rate(http_requests_total{namespace=\"$namespace\"}[2m]))) * 100",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 95   },
+              { "color": "green",  "value": 99   }
+            ]
+          },
+          "mappings": [
+            { "type": "range", "options": { "from": 0,  "to": 94,  "result": { "text": "ROLLBACK NOW",  "color": "red"    } } },
+            { "type": "range", "options": { "from": 95, "to": 98,  "result": { "text": "WATCH CLOSELY", "color": "yellow" } } },
+            { "type": "range", "options": { "from": 99, "to": 100, "result": { "text": "HEALTHY",       "color": "green"  } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Error Rate — Last 5 Min",
+      "description": "SLO: < 0.1%. Above 1% = ROLLBACK.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{
+        "expr": "sum(rate(http_requests_total{namespace=\"$namespace\",status=~\"5..\"}[5m])) / sum(rate(http_requests_total{namespace=\"$namespace\"}[5m])) * 100",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 3,
+          "thresholds": {
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 0.1  },
+              { "color": "orange", "value": 0.5  },
+              { "color": "red",    "value": 1.0  }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "p99 Latency",
+      "description": "SLO: < 500ms. Above 1s = investigate.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{
+        "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{namespace=\"$namespace\"}[5m])) by (le)) * 1000",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 300  },
+              { "color": "orange", "value": 500  },
+              { "color": "red",    "value": 1000 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "SLO Burn Rate",
+      "description": "1x = normal. 14x = page immediately.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{
+        "expr": "(sum(rate(http_requests_total{namespace=\"$namespace\",status=~\"5..\"}[5m])) / sum(rate(http_requests_total{namespace=\"$namespace\"}[5m]))) / 0.001",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "noValue": "0x",
+          "thresholds": {
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 2    },
+              { "color": "orange", "value": 6    },
+              { "color": "red",    "value": 14   }
+            ]
+          }
+        },
+        "overrides": [{
+          "matcher": { "id": "byName", "options": "Value" },
+          "properties": [{ "id": "displayName", "value": "burn rate" }]
+        }]
+      }
+    },
+    {
+      "id": 5,
+      "title": "Error Rate Trend (canary vs stable)",
+      "description": "If canary line is ABOVE stable = rollback.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{namespace=\"$namespace\",service=~\".*-canary\",status=~\"5..\"}[2m])) / sum(rate(http_requests_total{namespace=\"$namespace\",service=~\".*-canary\"}[2m])) * 100",
+          "legendFormat": "CANARY error rate %"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{namespace=\"$namespace\",service=~\".*-stable\",status=~\"5..\"}[2m])) / sum(rate(http_requests_total{namespace=\"$namespace\",service=~\".*-stable\"}[2m])) * 100",
+          "legendFormat": "STABLE error rate %"
+        },
+        {
+          "expr": "vector(1)",
+          "legendFormat": "SLO threshold (1%)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": { "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "CANARY error rate %" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "STABLE error rate %" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "SLO threshold (1%)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 6,
+      "title": "Latency Comparison (canary vs stable)",
+      "description": "Canary should not be significantly slower than stable.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{namespace=\"$namespace\",service=~\".*-canary\"}[5m])) by (le)) * 1000",
+          "legendFormat": "CANARY p99 (ms)"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{namespace=\"$namespace\",service=~\".*-stable\"}[5m])) by (le)) * 1000",
+          "legendFormat": "STABLE p99 (ms)"
+        },
+        {
+          "expr": "vector(500)",
+          "legendFormat": "SLO threshold (500ms)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 7,
+      "title": "Pod Restarts (last 10 min)",
+      "description": "Any restarts post-deploy = investigate.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{
+        "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=\"$namespace\"}[5m])) by (pod)",
+        "legendFormat": "{{pod}}"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 80 },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 1    }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Rollout Progress",
+      "description": "Updated replicas / desired replicas = rollout progress",
+      "type": "bargauge",
+      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 20 },
+      "targets": [{
+        "expr": "kube_deployment_status_replicas_updated{namespace=\"$namespace\"} / kube_deployment_spec_replicas{namespace=\"$namespace\"} * 100",
+        "legendFormat": "{{deployment}}",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0, "max": 100,
+          "thresholds": {
+            "steps": [
+              { "color": "red",    "value": null  },
+              { "color": "yellow", "value": 50    },
+              { "color": "green",  "value": 100   }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Deployed Version",
+      "description": "Which app version is currently running",
+      "type": "table",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 20 },
+      "targets": [{
+        "expr": "app_info{namespace=\"$namespace\"}",
+        "instant": true,
+        "format": "table"
+      }],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "version": "Version",
+              "git_sha": "Git SHA",
+              "environment": "Env",
+              "service": "Service"
+            },
+            "excludeByName": { "Time": true, "Value": true, "__name__": true }
+          }
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Deployments",
+        "datasource": "Prometheus",
+        "expr": "changes(kube_deployment_metadata_generation{namespace=\"$namespace\"}[5m]) > 0",
+        "step": "60s",
+        "titleFormat": "Deploy: {{deployment}}",
+        "tagKeys": "deployment",
+        "iconColor": "blue"
+      }
+    ]
+  }
+}

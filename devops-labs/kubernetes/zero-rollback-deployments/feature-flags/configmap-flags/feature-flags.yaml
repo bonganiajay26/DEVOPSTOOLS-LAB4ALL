@@ -1,0 +1,95 @@
+# ConfigMap-Based Feature Flags (no Unleash required)
+# Simple but effective for small teams or apps that can hot-reload config.
+#
+# Toggle a flag:
+#   kubectl patch configmap feature-flags -n production \
+#     --type=merge -p '{"data":{"NEW_CHECKOUT_FLOW":"false"}}'
+#   kubectl rollout restart deployment/myapp -n production   # if no hot-reload
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+  namespace: production
+  labels:
+    app: feature-flags
+    managed-by: platform-team
+  annotations:
+    description: "Feature flags. Toggle values without a code deployment."
+    last-updated-by: "platform@company.com"
+    last-updated-at: "2024-01-15"
+data:
+  # ── New features (default: false = safe) ──────────────────
+  NEW_CHECKOUT_FLOW:        "false"   # v2 checkout — deploy dark, enable when ready
+  NEW_RECOMMENDATION_ENGINE: "false"  # ML-based recommender — off until validated
+  REAL_TIME_COLLABORATION:  "false"   # WebSocket feature — off until infra ready
+
+  # ── Operational flags (default: normal operation) ─────────
+  USE_REDIS_CACHE:          "true"    # Toggle: false = bypass cache (debug)
+  USE_NEW_PAYMENT_PROVIDER: "true"    # Toggle: false = fallback to old provider
+  ENABLE_RATE_LIMITING:     "true"    # Toggle: false = disable during incidents
+
+  # ── Gradual rollout (percentage as string) ─────────────────
+  NEW_SEARCH_ROLLOUT_PCT:   "0"       # 0-100: % of users getting new search
+  ML_PRICING_ROLLOUT_PCT:   "25"      # 25% of users see ML-generated prices
+
+  # ── Maintenance modes ─────────────────────────────────────
+  READ_ONLY_MODE:           "false"   # "true" = block all writes (DB maintenance)
+  MAINTENANCE_BANNER:       "false"   # "true" = show banner to users
+  MAINTENANCE_MESSAGE:      "We are performing scheduled maintenance. Read-only mode active."
+
+  # ── Debug flags ───────────────────────────────────────────
+  VERBOSE_LOGGING:          "false"   # Enable detailed logging (performance impact)
+  SLOW_QUERY_THRESHOLD_MS:  "1000"    # Log queries slower than this
+
+---
+# How to use in Python (reading from env vars mounted from ConfigMap)
+# app.py
+#
+# import os
+#
+# def is_feature_enabled(flag_name: str, default: bool = False) -> bool:
+#     val = os.environ.get(flag_name, str(default)).lower()
+#     return val in ("true", "1", "yes", "on")
+#
+# def get_rollout_pct(flag_name: str) -> int:
+#     return int(os.environ.get(flag_name, "0"))
+#
+# # Usage
+# if is_feature_enabled("NEW_CHECKOUT_FLOW"):
+#     return new_checkout()
+# return old_checkout()
+
+---
+# Mount ConfigMap as environment variables in Deployment
+# (Add to your Deployment spec)
+#
+# spec:
+#   template:
+#     spec:
+#       containers:
+#       - name: app
+#         envFrom:
+#         - configMapRef:
+#             name: feature-flags
+#
+# OR mount as a file (allows hot-reload without restart):
+#
+# spec:
+#   template:
+#     spec:
+#       volumes:
+#       - name: feature-flags
+#         configMap:
+#           name: feature-flags
+#       containers:
+#       - name: app
+#         volumeMounts:
+#         - name: feature-flags
+#           mountPath: /etc/feature-flags
+#
+# Then read in app:
+# import json
+# with open('/etc/feature-flags/NEW_CHECKOUT_FLOW') as f:
+#     new_checkout_enabled = f.read().strip() == 'true'

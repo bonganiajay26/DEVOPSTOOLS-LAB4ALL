@@ -1,0 +1,194 @@
+# Chaos Engineering in Staging — LitmusChaos Experiments
+# Run these BEFORE every production deployment to verify resilience.
+#
+# Install LitmusChaos:
+#   helm repo add litmuschaos https://litmuschaos.github.io/litmus-helm/
+#   helm install chaos litmuschaos/litmus \
+#     --namespace litmus --create-namespace
+#
+# Apply: kubectl apply -f staging-chaos.yaml -n staging
+# Watch: kubectl get chaosengine -n staging -w
+
+---
+# ── Experiment 1: Pod Kill — verify self-healing ──────────────
+# Kill 50% of staging pods. Service should remain available.
+# If health checks fail during this → app is NOT production-ready.
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: pod-kill-resilience
+  namespace: staging
+spec:
+  appinfo:
+    appns: staging
+    applabel: "app=myapp"
+    appkind: deployment
+
+  # Run health checks during chaos (abort if service goes down)
+  jobCleanUpPolicy: retain
+
+  experiments:
+  - name: pod-delete
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "60"         # 60 seconds of pod killing
+        - name: CHAOS_INTERVAL
+          value: "10"         # Kill a pod every 10 seconds
+        - name: FORCE
+          value: "false"      # Graceful kill (SIGTERM first)
+        - name: PODS_AFFECTED_PERC
+          value: "50"         # Kill 50% of pods at once
+
+        # Probe: service must respond during chaos
+        probe:
+        - name: http-liveness-probe
+          type: httpProbe
+          httpProbe/inputs:
+            url: "https://staging.company.com/health"
+            insecureSkipVerify: false
+            responseTimeout: 2000
+            method:
+              get:
+                criteria: "=="
+                responseCode: "200"
+          mode: Continuous
+          runProperties:
+            probeTimeout: 5
+            interval: 5
+            retry: 2
+
+---
+# ── Experiment 2: Network Latency — verify timeout handling ───
+# Inject 500ms latency into all staging pod network traffic.
+# Verify: app returns responses (with degradation), not errors.
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: network-latency-resilience
+  namespace: staging
+spec:
+  appinfo:
+    appns: staging
+    applabel: "app=myapp"
+    appkind: deployment
+
+  experiments:
+  - name: pod-network-latency
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "60"
+        - name: NETWORK_LATENCY
+          value: "500"        # 500ms latency injection
+        - name: JITTER
+          value: "100"        # ±100ms jitter
+        - name: DESTINATION_HOSTS
+          value: "postgres.database.svc.cluster.local"   # Target: DB traffic
+
+        probe:
+        - name: api-still-responds
+          type: httpProbe
+          httpProbe/inputs:
+            url: "https://staging.company.com/api/v1/status"
+            responseTimeout: 2000   # Must respond within 2s even with 500ms latency
+            method:
+              get:
+                criteria: "=="
+                responseCode: "200"
+          mode: Continuous
+          runProperties:
+            probeTimeout: 5
+            interval: 10
+            retry: 2
+
+---
+# ── Experiment 3: Memory Stress — verify OOM prevention ──────
+# Consume 256MB of memory in staging pods.
+# Verify: app doesn't crash (memory limits work correctly).
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: memory-stress-resilience
+  namespace: staging
+spec:
+  appinfo:
+    appns: staging
+    applabel: "app=myapp"
+
+  experiments:
+  - name: pod-memory-hog
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "60"
+        - name: MEMORY_CONSUMPTION
+          value: "256"        # 256MB memory pressure
+        - name: NUMBER_OF_WORKERS
+          value: "1"
+
+        probe:
+        - name: pods-not-oom-killed
+          type: k8sProbe
+          k8sProbe/inputs:
+            group: ""
+            version: v1
+            resource: pods
+            namespace: staging
+            operation: present
+            fieldSelector: "status.phase=Running"
+            labelSelector: "app=myapp"
+          mode: EOT            # End Of Test: verify at end
+          runProperties:
+            probeTimeout: 10
+            interval: 10
+            retry: 1
+
+---
+# ── ChaosServiceAccount (required by LitmusChaos) ─────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litmus-admin
+  namespace: staging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: litmus-admin
+rules:
+- apiGroups: ["", "apps", "batch", "extensions", "litmuschaos.io"]
+  resources: ["*"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: litmus-admin
+  namespace: staging
+roleRef:
+  kind: ClusterRole
+  name: litmus-admin
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── How to run chaos and check results ───────────────────────
+# Apply:
+#   kubectl apply -f staging-chaos.yaml -n staging
+#
+# Watch experiment progress:
+#   kubectl get chaosengine pod-kill-resilience -n staging -w
+#   kubectl describe chaosresult pod-kill-resilience-pod-delete -n staging
+#
+# Result should show:
+#   verdict: Pass     ← service survived the chaos
+#   probeSuccessPercentage: 100  ← health checks passed during chaos
+#
+# If verdict: Fail → service is NOT production-ready
+# Fix: increase replicas, improve readiness probes, add circuit breakers

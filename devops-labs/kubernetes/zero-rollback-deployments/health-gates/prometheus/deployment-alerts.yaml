@@ -1,0 +1,204 @@
+# Prometheus Alerts — Deployment Health Gates
+# These alerts fire within minutes of a bad deployment,
+# before users file support tickets.
+#
+# Key insight: scope alerts to a deployment window using
+# kube_deployment_metadata_generation to track deploy time.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: deployment-health-gates
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+
+  # ── Recording rules: deployment event tracking ────────────
+  - name: deployment-tracking
+    interval: 30s
+    rules:
+    # Track when a deployment last changed (for correlation)
+    - record: namespace_deployment:last_deploy_time
+      expr: |
+        kube_deployment_metadata_generation
+        * on(deployment, namespace)
+        group_left(label_version)
+        kube_deployment_labels
+
+    # Error rate per deployment (not just namespace)
+    - record: namespace_deployment:error_rate:2m
+      expr: |
+        sum(
+          rate(http_requests_total{status=~"5.."}[2m])
+        ) by (namespace, deployment)
+        /
+        sum(
+          rate(http_requests_total[2m])
+        ) by (namespace, deployment)
+
+  # ── Alert 1: Error spike immediately post-deploy ──────────
+  # Fires if error rate jumps within 10 min of a new deployment
+  - name: post-deploy-error-spike
+    rules:
+    - alert: PostDeployErrorSpike
+      expr: |
+        (
+          # Current error rate > 2%
+          namespace_deployment:error_rate:2m > 0.02
+        )
+        and
+        (
+          # A deployment happened in the last 10 minutes
+          (time() - kube_deployment_metadata_generation_time) < 600
+        )
+      for: 2m
+      labels:
+        severity: critical
+        category: deployment
+        auto_rollback: "true"
+      annotations:
+        summary: "Error spike after deploy: {{ $labels.namespace }}/{{ $labels.deployment }}"
+        description: |
+          Error rate {{ $value | humanizePercentage }} detected within 10 minutes of deployment.
+          This strongly suggests the deployment caused the issue.
+        action: "kubectl rollout undo deployment/{{ $labels.deployment }} -n {{ $labels.namespace }}"
+        runbook: https://wiki.company.com/runbooks/post-deploy-rollback
+
+    # ── Alert 2: Latency regression post-deploy ──────────────
+    - alert: PostDeployLatencyRegression
+      expr: |
+        (
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[2m])) by (namespace, le)
+          ) > 1.0
+        )
+        and
+        (
+          (time() - kube_deployment_metadata_generation_time) < 600
+        )
+      for: 3m
+      labels:
+        severity: warning
+        category: deployment
+      annotations:
+        summary: "Latency regression post-deploy in {{ $labels.namespace }}"
+        description: |
+          p99 latency {{ $value | humanizeDuration }} detected within 10 min of deployment.
+        action: "Check new code for N+1 queries or missing indexes"
+
+  # ── Alert 3: Rollout stuck ────────────────────────────────
+  - name: rollout-health
+    rules:
+    - alert: DeploymentRolloutStuck
+      expr: |
+        kube_deployment_status_replicas_updated
+        !=
+        kube_deployment_spec_replicas
+      for: 10m
+      labels:
+        severity: warning
+        category: deployment
+      annotations:
+        summary: "Rollout stuck: {{ $labels.namespace }}/{{ $labels.deployment }}"
+        description: |
+          {{ $labels.deployment }} has been rolling out for 10+ minutes.
+          Updated: {{ $value }} of {{ $labels.desired }} replicas.
+          Pods may be failing to start.
+        action: |
+          kubectl describe deployment/{{ $labels.deployment }} -n {{ $labels.namespace }}
+          kubectl get pods -n {{ $labels.namespace }} -l app={{ $labels.deployment }}
+
+    - alert: DeploymentReplicasMismatch
+      expr: |
+        kube_deployment_spec_replicas
+        !=
+        kube_deployment_status_replicas_available
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }} has unavailable replicas"
+        description: |
+          {{ $labels.deployment }}: {{ $value }} replicas unavailable for 15+ minutes.
+
+    - alert: ContainerRestartingPostDeploy
+      expr: |
+        (
+          increase(kube_pod_container_status_restarts_total[10m]) > 2
+        )
+        and on(namespace)
+        (
+          (time() - kube_deployment_metadata_generation_time) < 600
+        )
+      for: 0m
+      labels:
+        severity: warning
+        category: deployment
+      annotations:
+        summary: "Container restarting after deploy: {{ $labels.pod }}"
+        description: "{{ $value }} restarts in 10 min post-deploy. Likely startup failure."
+        action: "kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous"
+
+  # ── Alert 4: Canary health (for Argo Rollouts) ────────────
+  - name: canary-health
+    rules:
+    - alert: CanaryErrorRateTooHigh
+      expr: |
+        sum(
+          rate(http_requests_total{service=~".*-canary",status=~"5.."}[2m])
+        ) by (namespace, service)
+        /
+        sum(
+          rate(http_requests_total{service=~".*-canary"}[2m])
+        ) by (namespace, service)
+        > 0.05
+      for: 2m
+      labels:
+        severity: critical
+        category: canary
+      annotations:
+        summary: "Canary error rate too high: {{ $labels.service }}"
+        description: |
+          Canary slot error rate {{ $value | humanizePercentage }}.
+          Argo Rollouts should auto-abort. If not: kubectl argo rollouts abort <rollout>
+
+    - alert: CanaryLatencyTooHigh
+      expr: |
+        histogram_quantile(0.99,
+          sum(
+            rate(http_request_duration_seconds_bucket{service=~".*-canary"}[2m])
+          ) by (le, service, namespace)
+        ) > 2.0
+      for: 3m
+      labels:
+        severity: warning
+        category: canary
+      annotations:
+        summary: "Canary p99 latency too high: {{ $labels.service }}"
+        description: "p99 latency {{ $value | humanizeDuration }} on canary slot"
+
+  # ── Recording rules: deployment success rate ──────────────
+  - name: deployment-success-tracking
+    interval: 1m
+    rules:
+    # Track: of all deployments, how many succeeded vs rolled back
+    - record: deployment:rollback_rate:7d
+      expr: |
+        sum(increase(argocd_app_sync_total{phase="Failed"}[7d])) by (name)
+        /
+        sum(increase(argocd_app_sync_total[7d])) by (name)
+
+    # Alert if rollback rate > 20% over 7 days (process problem)
+    - alert: HighRollbackRate
+      expr: deployment:rollback_rate:7d > 0.20
+      for: 1h
+      labels:
+        severity: warning
+        category: process
+      annotations:
+        summary: "High rollback rate for {{ $labels.name }}: {{ $value | humanizePercentage }}"
+        description: |
+          {{ $labels.name }} has had {{ $value | humanizePercentage }} of deploys rolled back
+          in the last 7 days. Consider adding more pre-prod gates.

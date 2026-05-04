@@ -1,0 +1,169 @@
+# AnalysisTemplate — Prometheus-Based Health Gates
+#
+# This is the heart of automated rollback prevention.
+# At each canary step, Argo Rollouts runs this analysis.
+# If any metric fails the threshold → automatic rollback.
+#
+# The template runs continuously during the canary window:
+#   - Queries Prometheus every 30 seconds
+#   - If X consecutive failures → mark analysis "Failed"
+#   - Argo Rollouts sees Failed analysis → aborts and rolls back
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: myapp-health-check
+  namespace: production
+spec:
+  args:
+  - name: service-name
+  - name: namespace
+    value: production
+  - name: threshold-error-rate
+    value: "0.01"
+  - name: threshold-latency-p99-ms
+    value: "500"
+
+  metrics:
+  # ── Metric 1: Error rate ──────────────────────────────────
+  - name: error-rate
+    interval: 30s
+    count: 5             # Run 5 times (5 × 30s = 2.5 min check window)
+    successCondition: result[0] < {{ args.threshold-error-rate }}
+    failureLimit: 1      # 1 failure = abort rollout immediately
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: |
+          sum(
+            rate(http_requests_total{
+              namespace="{{ args.namespace }}",
+              service="{{ args.service-name }}",
+              status=~"5.."
+            }[2m])
+          )
+          /
+          sum(
+            rate(http_requests_total{
+              namespace="{{ args.namespace }}",
+              service="{{ args.service-name }}"
+            }[2m])
+          )
+
+  # ── Metric 2: p99 latency ─────────────────────────────────
+  - name: latency-p99
+    interval: 30s
+    count: 5
+    # Convert seconds to ms and compare to threshold
+    successCondition: result[0] < ({{ args.threshold-latency-p99-ms }} / 1000)
+    failureLimit: 2      # Allow 2 latency spikes before failing
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: |
+          histogram_quantile(0.99,
+            sum(
+              rate(http_request_duration_seconds_bucket{
+                namespace="{{ args.namespace }}",
+                service="{{ args.service-name }}"
+              }[2m])
+            ) by (le)
+          )
+
+  # ── Metric 3: Success rate must be > 99% ─────────────────
+  - name: success-rate
+    interval: 60s
+    count: 3
+    successCondition: result[0] > 0.99
+    failureLimit: 1
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: |
+          sum(
+            rate(http_requests_total{
+              namespace="{{ args.namespace }}",
+              service="{{ args.service-name }}",
+              status=~"2..|3.."
+            }[5m])
+          )
+          /
+          sum(
+            rate(http_requests_total{
+              namespace="{{ args.namespace }}",
+              service="{{ args.service-name }}"
+            }[5m])
+          )
+
+  # ── Metric 4: Pod crash rate ──────────────────────────────
+  - name: pod-restart-rate
+    interval: 60s
+    count: 3
+    successCondition: result[0] < 1
+    failureLimit: 1
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: |
+          sum(
+            increase(
+              kube_pod_container_status_restarts_total{
+                namespace="{{ args.namespace }}"
+              }[5m]
+            )
+          ) by (pod)
+
+---
+# ── AnalysisRun (created manually or by Rollout) ─────────────
+# Manual analysis run example (for testing the analysis template):
+#
+# apiVersion: argoproj.io/v1alpha1
+# kind: AnalysisRun
+# metadata:
+#   name: test-health-check
+#   namespace: production
+# spec:
+#   templates:
+#   - templateName: myapp-health-check
+#   args:
+#   - name: service-name
+#     value: myapp-canary
+#   - name: namespace
+#     value: production
+#   - name: threshold-error-rate
+#     value: "0.05"
+#   - name: threshold-latency-p99-ms
+#     value: "500"
+#
+# Check status:
+#   kubectl get analysisrun -n production
+#   kubectl describe analysisrun test-health-check -n production
+
+---
+# ── Background AnalysisTemplate (runs for full canary duration) ──
+# This runs continuously while canary is live, not just at steps
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: myapp-continuous-health
+  namespace: production
+spec:
+  args:
+  - name: service-name
+  - name: namespace
+    value: production
+
+  metrics:
+  # Continuous background check: run every 2 min, no count limit
+  - name: continuous-error-rate
+    interval: 2m
+    # No count: runs until rollout completes or fails
+    successCondition: result[0] < 0.02
+    failureLimit: 3      # 3 consecutive failures = abort
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: |
+          sum(rate(http_requests_total{service="{{ args.service-name }}",status=~"5.."}[2m]))
+          /
+          sum(rate(http_requests_total{service="{{ args.service-name }}"}[2m]))

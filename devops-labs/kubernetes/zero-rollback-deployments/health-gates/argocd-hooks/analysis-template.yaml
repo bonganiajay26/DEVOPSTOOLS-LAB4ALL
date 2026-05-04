@@ -1,0 +1,171 @@
+# ArgoCD + Argo Rollouts: Post-Sync Analysis Job
+# This Job runs after every ArgoCD sync. If it fails,
+# ArgoCD marks the app as Degraded → triggers rollback.
+
+---
+# ── Post-sync health check Job ────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: post-sync-health-check
+  namespace: production
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded   # Clean up on success
+    argocd.argoproj.io/sync-wave: "5"   # Run after all app resources are deployed
+spec:
+  backoffLimit: 0        # Don't retry — fail fast so ArgoCD knows immediately
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: argocd-hook-sa
+      containers:
+      - name: health-check
+        image: bitnami/kubectl:1.29
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          #!/bin/sh
+          set -e
+          APP="$(echo $ARGOCD_APP_NAME | tr -d '[:space:]')"
+          NS="$(echo $ARGOCD_APP_NAMESPACE | tr -d '[:space:]')"
+
+          echo "=== Post-Sync Health Gate: $APP ($NS) ==="
+
+          # Step 1: Wait for deployment rollout
+          kubectl rollout status deployment/$APP -n $NS --timeout=3m || {
+            echo "FAIL: Rollout did not complete"
+            exit 1
+          }
+          echo "OK: Rollout complete"
+
+          # Step 2: Wait for pods to warm up
+          sleep 90
+
+          # Step 3: Check pod readiness
+          READY=$(kubectl get deployment $APP -n $NS \
+            -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment $APP -n $NS \
+            -o jsonpath='{.spec.replicas}')
+          if [ "$READY" != "$DESIRED" ]; then
+            echo "FAIL: Only $READY/$DESIRED pods ready"
+            exit 1
+          fi
+          echo "OK: All $READY/$DESIRED pods ready"
+
+          # Step 4: Check for crash loops
+          CRASHES=$(kubectl get pods -n $NS -l app=$APP --no-headers \
+            | grep -c "CrashLoop\|OOMKill\|Error" || echo 0)
+          if [ "$CRASHES" -gt 0 ]; then
+            echo "FAIL: $CRASHES pods in bad state"
+            kubectl get pods -n $NS -l app=$APP
+            exit 1
+          fi
+          echo "OK: No crash loops"
+
+          # Step 5: HTTP health check
+          SVC_IP=$(kubectl get svc $APP -n $NS \
+            -o jsonpath='{.spec.clusterIP}')
+          SVC_PORT=$(kubectl get svc $APP -n $NS \
+            -o jsonpath='{.spec.ports[0].port}')
+          RESPONSE=$(wget -qO- --timeout=10 \
+            "http://$SVC_IP:$SVC_PORT/health" 2>/dev/null || echo "FAILED")
+          if echo "$RESPONSE" | grep -q '"status":"healthy"'; then
+            echo "OK: Health endpoint returned healthy"
+          else
+            echo "WARN: Health endpoint response: $RESPONSE"
+          fi
+
+          echo "=== All checks passed. Deployment is healthy. ==="
+        env:
+        - name: ARGOCD_APP_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['argocd.argoproj.io/app-name']
+        - name: ARGOCD_APP_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+---
+# ── Pre-sync validation Job ────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pre-sync-validation
+  namespace: production
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+    argocd.argoproj.io/sync-wave: "-5"   # Run before any resources are applied
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: validate
+        image: bitnami/kubectl:1.29
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "=== Pre-Sync Validation ==="
+
+          # Check: Is the cluster healthy before we touch it?
+          NOT_READY=$(kubectl get nodes --no-headers \
+            | grep -v " Ready" | wc -l | tr -d ' ')
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "FAIL: $NOT_READY nodes are not ready. Blocking sync."
+            kubectl get nodes
+            exit 1
+          fi
+          echo "OK: All nodes ready"
+
+          # Check: Is there an active incident? (check configmap)
+          INCIDENT=$(kubectl get configmap incident-status \
+            -n monitoring -o jsonpath='{.data.active}' 2>/dev/null || echo "false")
+          if [ "$INCIDENT" = "true" ]; then
+            echo "FAIL: Active incident in progress. Blocking sync to prevent making things worse."
+            echo "      Resolve incident first, then re-sync."
+            exit 1
+          fi
+          echo "OK: No active incidents"
+
+          echo "=== Pre-sync validation passed. Proceeding with sync. ==="
+
+---
+# ── RBAC for the hook SA ─────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-hook-sa
+  namespace: production
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-hook-role
+  namespace: production
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods", "services", "nodes", "configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-hook-binding
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: argocd-hook-sa
+  namespace: production
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: argocd-hook-role

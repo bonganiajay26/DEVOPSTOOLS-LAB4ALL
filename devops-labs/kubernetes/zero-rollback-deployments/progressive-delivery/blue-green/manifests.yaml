@@ -1,0 +1,194 @@
+# Blue/Green Deployment — Complete K8s Setup
+#
+# Architecture:
+#   Service (production) → selects EITHER blue or green via label
+#   Service (preview)    → always points to inactive deployment
+#
+# Promotion flow:
+#   1. Deploy new version to "green" (inactive)
+#   2. Run smoke tests against preview service
+#   3. Patch production service selector to green (atomic switch)
+#   4. Monitor for 15 min
+#   5. If healthy → scale down blue
+#   6. If degraded → revert service selector to blue (instant rollback)
+#
+# Apply: kubectl apply -f manifests.yaml -n production
+
+---
+# ── BLUE deployment (current live version) ───────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-blue
+  namespace: production
+  labels:
+    app: myapp
+    slot: blue
+    version: v2.3.0
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: myapp
+      slot: blue
+  template:
+    metadata:
+      labels:
+        app: myapp
+        slot: blue
+        version: v2.3.0
+    spec:
+      containers:
+      - name: app
+        image: myregistry.io/myapp:v2.3.0
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+---
+# ── GREEN deployment (new version — starts at 0 replicas) ────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-green
+  namespace: production
+  labels:
+    app: myapp
+    slot: green
+    version: v2.4.0
+spec:
+  replicas: 0              # Start at zero — scaled up when ready to test
+  selector:
+    matchLabels:
+      app: myapp
+      slot: green
+  template:
+    metadata:
+      labels:
+        app: myapp
+        slot: green
+        version: v2.4.0
+    spec:
+      containers:
+      - name: app
+        image: myregistry.io/myapp:v2.4.0
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+---
+# ── PRODUCTION service (routes to ACTIVE slot) ───────────────
+# Selector is patched during promotion to switch traffic
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+  namespace: production
+  labels:
+    app: myapp
+  annotations:
+    deployment.company.com/active-slot: blue   # Track which slot is live
+spec:
+  selector:
+    app: myapp
+    slot: blue               # ← THIS IS PATCHED during blue→green switch
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# ── PREVIEW service (routes to INACTIVE slot for testing) ────
+# Use this to smoke-test green before promoting
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-preview
+  namespace: production
+spec:
+  selector:
+    app: myapp
+    slot: green              # Always points to green (the candidate)
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# ── Ingress: production + preview hostnames ───────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - api.company.com
+    - preview.company.com
+    secretName: myapp-tls
+  rules:
+  # Production traffic → active slot
+  - host: api.company.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: myapp
+            port:
+              number: 80
+  # Preview traffic → green slot (for testing before promotion)
+  - host: preview.company.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: myapp-preview
+            port:
+              number: 80
+
+---
+# ── PodDisruptionBudget (prevents all pods from being deleted at once) ──
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: myapp-pdb
+  namespace: production
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: myapp

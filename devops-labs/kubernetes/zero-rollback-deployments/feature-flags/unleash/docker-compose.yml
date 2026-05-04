@@ -1,0 +1,99 @@
+# Self-Hosted Unleash Feature Flag Server
+# Production-ready setup with PostgreSQL backend.
+#
+# Start:   docker compose up -d
+# Open:    http://localhost:4242   (admin / unleash4all)
+# API URL: http://localhost:4242/api
+#
+# For K8s deployment: helm install unleash unleash/unleash
+
+name: unleash-flags
+
+services:
+  # ── Unleash Feature Flag Server ──────────────────────────────
+  unleash:
+    image: unleashorg/unleash-server:6
+    ports:
+    - "4242:4242"
+    environment:
+      DATABASE_URL: "postgresql://unleash:unleash@postgres:5432/unleash"
+      DATABASE_SSL:  "false"
+      LOG_LEVEL:     "warn"
+
+      # Admin account (change in production!)
+      INIT_ADMIN_API_TOKENS: "*:*.unleash-insecure-api-token"
+      INIT_FRONTEND_API_TOKENS: "default:development.unleash-insecure-frontend-api-token"
+
+      # Authentication (change to your identity provider)
+      AUTH_TYPE: "open-source"    # or: "enterprise" for LDAP/SAML
+
+      # Server config
+      SERVER_KEEPALIVE_TIMEOUT: "15"
+      GRACEFUL_SHUTDOWN_ENABLE: "true"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4242/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── PostgreSQL backend ────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER:     unleash
+      POSTGRES_PASSWORD: unleash
+      POSTGRES_DB:       unleash
+    volumes:
+    - unleash-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U unleash -d unleash"]
+      interval: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Prometheus metrics exporter for Unleash ───────────────────
+  unleash-exporter:
+    image: prom/unleash-exporter:latest
+    environment:
+      UNLEASH_URL: http://unleash:4242
+      UNLEASH_API_TOKEN: "*:*.unleash-insecure-api-token"
+    ports:
+    - "9100:9090"
+    depends_on:
+    - unleash
+    restart: unless-stopped
+
+volumes:
+  unleash-db:
+
+# ── After startup: create flags via API ──────────────────────
+# curl -s http://localhost:4242/api/admin/features \
+#   -H "Authorization: *:*.unleash-insecure-api-token" \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#     "name": "new-checkout-flow",
+#     "description": "New v2 checkout. Roll out gradually.",
+#     "type": "release",
+#     "enabled": false,
+#     "strategies": [{
+#       "name": "gradualRolloutUserId",
+#       "parameters": {
+#         "percentage": "10",
+#         "groupId": "new-checkout-flow"
+#       }
+#     }]
+#   }'
+#
+# ── K8s ConfigMap for SDK config ─────────────────────────────
+# apiVersion: v1
+# kind: ConfigMap
+# metadata:
+#   name: unleash-config
+#   namespace: production
+# data:
+#   UNLEASH_URL: "http://unleash.feature-flags.svc.cluster.local:4242/api"

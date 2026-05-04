@@ -1,0 +1,201 @@
+# GitHub Actions — Blue/Green Production Pipeline
+# Full workflow: build → pre-prod gates → green deploy → smoke tests → atomic switch
+#
+# .github/workflows/deploy-blue-green.yml
+
+name: Blue/Green Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  IMAGE:    ghcr.io/${{ github.repository }}/myapp
+  NS:       production
+  SERVICE:  myapp
+
+jobs:
+
+  # ── Build once ─────────────────────────────────────────────
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
+    - uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.IMAGE }}
+        tags: type=sha,format=short
+
+    - uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: production
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # ── Unit + SAST gates ──────────────────────────────────────
+  gates:
+    name: Pre-Production Gates
+    needs: build
+    uses: ./.github/workflows/pre-prod-gates.yml    # Calls full-gate-pipeline.yml
+    secrets: inherit
+
+  # ── Deploy to GREEN slot ───────────────────────────────────
+  deploy-green:
+    name: Deploy to Green
+    needs: [build, gates]
+    runs-on: ubuntu-latest
+    environment:
+      name: production-green               # Separate env for visibility
+      url: https://preview.company.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure kubectl
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+        aws-region: us-east-1
+    - run: aws eks update-kubeconfig --name production-cluster --region us-east-1
+
+    - name: Deploy new image to GREEN slot
+      env:
+        IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+      run: |
+        echo "Deploying ${{ env.IMAGE }}:$IMAGE_TAG to GREEN slot..."
+
+        # Update green deployment image
+        kubectl set image deployment/${{ env.SERVICE }}-green \
+          app=${{ env.IMAGE }}:$IMAGE_TAG \
+          -n ${{ env.NS }}
+
+        # Scale up green
+        kubectl scale deployment/${{ env.SERVICE }}-green \
+          --replicas=5 -n ${{ env.NS }}
+
+        # Wait for rollout
+        kubectl rollout status deployment/${{ env.SERVICE }}-green \
+          -n ${{ env.NS }} --timeout=5m
+
+        echo "Green slot ready. Preview: https://preview.company.com"
+
+  # ── Smoke tests against GREEN before switching ─────────────
+  smoke-tests:
+    name: Smoke Tests on Green
+    needs: deploy-green
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - run: pip install pytest requests
+
+    - name: Run smoke tests against preview (GREEN)
+      env:
+        BASE_URL: https://preview.company.com
+      run: |
+        pytest tests/smoke/ -v --tb=short
+        echo "Smoke tests PASSED on green slot"
+
+    - name: Quick k6 load test on GREEN
+      uses: grafana/k6-action@v0.3.1
+      with:
+        filename: pre-prod-gates/k6/performance-baseline.js
+        flags: --duration 60s --vus 10
+      env:
+        BASE_URL: https://preview.company.com
+
+  # ── Atomic traffic switch ──────────────────────────────────
+  promote-green:
+    name: Promote Green → Production
+    needs: smoke-tests
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.company.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure kubectl
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+        aws-region: us-east-1
+    - run: aws eks update-kubeconfig --name production-cluster --region us-east-1
+
+    - name: Atomic traffic switch blue → green
+      run: |
+        echo "Switching production traffic to GREEN slot..."
+
+        # Patch Service selector to green (atomic — single API call)
+        kubectl patch service ${{ env.SERVICE }} -n ${{ env.NS }} \
+          -p '{"spec":{"selector":{"app":"${{ env.SERVICE }}","slot":"green"}}}'
+
+        kubectl annotate service ${{ env.SERVICE }} -n ${{ env.NS }} \
+          "deployment.company.com/switched-at=$(date -u '+%H:%M UTC')" \
+          "deployment.company.com/image-tag=${{ needs.build.outputs.image-tag }}" \
+          --overwrite
+
+        echo "Traffic switched to GREEN"
+
+    - name: Monitor for 5 minutes post-switch
+      run: |
+        echo "Monitoring error rate for 300 seconds..."
+        bash progressive-delivery/blue-green/traffic-switch.sh status
+        sleep 30
+
+        # Quick health check loop
+        for i in $(seq 1 10); do
+          STATUS=$(curl -sf --max-time 5 https://api.company.com/health \
+            -o /dev/null -w "%{http_code}" || echo "000")
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check $i: FAILED ($STATUS)"
+            # Auto rollback
+            kubectl patch service ${{ env.SERVICE }} -n ${{ env.NS }} \
+              -p '{"spec":{"selector":{"app":"${{ env.SERVICE }}","slot":"blue"}}}'
+            echo "ROLLED BACK to BLUE"
+            exit 1
+          fi
+          echo "Health check $i/10: OK"
+          sleep 30
+        done
+        echo "Health monitoring PASSED"
+
+    - name: Scale down BLUE (cleanup)
+      if: success()
+      run: |
+        kubectl scale deployment/${{ env.SERVICE }}-blue \
+          --replicas=0 -n ${{ env.NS }}
+        echo "Blue slot scaled down. Deployment complete."
+
+    - name: Notify on failure
+      if: failure()
+      uses: slackapi/slack-github-action@v1.26.0
+      with:
+        channel-id: C0DEPLOYMENTS
+        slack-message: |
+          :rotating_light: *DEPLOY FAILED + ROLLED BACK*
+          Service: `${{ env.SERVICE }}`
+          Commit: `${{ github.sha }}`
+          Reverted to BLUE slot automatically.
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
