@@ -1,0 +1,43 @@
+# Kubernetes pod annotations for Datadog log collection
+# Add to spec.template.metadata.annotations in your Deployment
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    metadata:
+      labels:
+        app: my-app
+        tags.datadoghq.com/env: production
+        tags.datadoghq.com/service: my-app
+        tags.datadoghq.com/version: "1.0.0"
+      annotations:
+        ad.datadoghq.com/my-app.logs: |
+          [{
+            "source": "python",
+            "service": "my-app",
+            "log_processing_rules": [{
+              "type": "multi_line",
+              "name": "log_start_with_date",
+              "pattern": "\\d{4}-\\d{2}-\\d{2}"
+            }]
+          }]
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:latest
+          env:
+            - name: DD_SERVICE
+              value: "my-app"
+            - name: DD_ENV
+              value: "production"
+            - name: DD_VERSION
+              value: "1.0.0"
+            - name: DD_AGENT_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: DD_TRACE_AGENT_PORT
+              value: "8126"

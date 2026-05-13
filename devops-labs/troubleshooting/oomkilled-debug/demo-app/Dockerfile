@@ -4,7 +4,7 @@
 # Run:   docker run -p 8080:8080 --memory=256m oom-demo:latest
 
 # ── Stage 1: Test ─────────────────────────────────────────────
-FROM python:3.12-slim AS test
+FROM public.ecr.aws/docker/library/python:3.12-slim AS test
 
 WORKDIR /app
 COPY requirements.txt .
@@ -14,18 +14,10 @@ COPY app.py .
 COPY tests/ tests/ 2>/dev/null || true
 
 # Run basic smoke test
-RUN python3 -c "
-import app, time
-# Verify app imports without error
-print('Import test: OK')
-# Verify leak list starts empty
-assert len(app.LEAKED_CHUNKS) == 0
-print('Initial state test: OK')
-print('All tests passed')
-"
+RUN python3 -c "import app; assert len(app.LEAKED_CHUNKS) == 0; print('All tests passed')"
 
 # ── Stage 2: Production ───────────────────────────────────────
-FROM python:3.12-slim AS production
+FROM public.ecr.aws/docker/library/python:3.12-slim AS production
 
 # Security: non-root user
 RUN useradd --uid 1001 --create-home appuser

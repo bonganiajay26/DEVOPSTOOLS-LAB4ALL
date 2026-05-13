@@ -1,0 +1,22 @@
+# Datadog Log Collection — File-based
+# Deploy to: /etc/datadog-agent/conf.d/my_app.d/conf.yaml
+
+logs:
+  - type: file
+    path: /var/log/myapp/*.log
+    service: my-app
+    source: python
+    sourcecategory: sourcecode
+    tags:
+      - env:production
+      - team:backend
+    log_processing_rules:
+      # Merge multi-line stack traces into one log entry
+      - type: multi_line
+        name: log_start_with_date
+        pattern: \d{4}-\d{2}-\d{2}
+      # Scrub email addresses (PII)
+      - type: mask_sequences
+        name: mask_emails
+        replace_placeholder: "[REDACTED_EMAIL]"
+        pattern: '[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.]+'

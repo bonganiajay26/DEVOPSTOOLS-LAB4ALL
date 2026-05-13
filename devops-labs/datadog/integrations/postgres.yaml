@@ -1,0 +1,22 @@
+# Datadog Integration — PostgreSQL
+# Deploy to: /etc/datadog-agent/conf.d/postgres.d/conf.yaml
+#
+# Pre-requisite: create monitoring user in Postgres
+#   CREATE USER datadog WITH PASSWORD 'your-password';
+#   GRANT pg_monitor TO datadog;
+#   GRANT SELECT ON pg_stat_database TO datadog;
+
+init_config:
+
+instances:
+  - host: localhost
+    port: 5432
+    username: datadog
+    password: ENC[datadog_secret, {"key": "postgres_password"}]
+    dbname: mydb
+    tags:
+      - service:postgres
+      - env:production
+    collect_activity_metrics: true
+    collect_database_size_metrics: true
+    collect_count_metrics: true

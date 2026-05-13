@@ -1,0 +1,46 @@
+# Datadog Agent — Main Configuration
+# Deploy to: /etc/datadog-agent/datadog.yaml
+
+api_key: ENC[datadog_secret, {"key": "api_key"}]  # store in secrets manager, never hardcode
+site: datadoghq.com                                 # use datadoghq.eu for EU data residency
+
+hostname: ""  # leave blank to auto-detect, or set explicitly: prod-api-server-01
+
+# ── Tagging strategy ─────────────────────────────────────────────
+tags:
+  - env:production
+  - team:platform
+  - service:my-service
+  - region:us-east-1
+  - datacenter:aws
+
+# ── Logs ─────────────────────────────────────────────────────────
+logs_enabled: true
+logs_config:
+  use_compression: true
+  compression_level: 6
+  batch_max_size: 1000
+  batch_max_content_size: 5000000
+
+# ── APM ──────────────────────────────────────────────────────────
+apm_config:
+  enabled: true
+  apm_non_local_traffic: true   # required when agent is on a different host/container
+  max_traces_per_second: 10
+
+# ── Process monitoring ────────────────────────────────────────────
+process_config:
+  enabled: true
+  process_collection:
+    enabled: true
+
+# ── System probe (NPM, OOM tracking) ─────────────────────────────
+system_probe_config:
+  enabled: true
+
+network_config:
+  enabled: true
+
+# ── Proxy (uncomment if traffic goes through a corporate proxy) ───
+# proxy:
+#   https: http://proxy.internal:8080

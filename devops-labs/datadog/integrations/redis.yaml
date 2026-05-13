@@ -1,0 +1,16 @@
+# Datadog Integration — Redis
+# Deploy to: /etc/datadog-agent/conf.d/redisdb.d/conf.yaml
+
+init_config:
+
+instances:
+  - host: localhost
+    port: 6379
+    # password: ENC[datadog_secret, {"key": "redis_password"}]
+    tags:
+      - service:redis
+      - env:production
+    keys:
+      - "*"    # track key counts (use carefully in large keyspaces)
+    warn_on_missing_keys: true
+    slowlog-max-len: 128

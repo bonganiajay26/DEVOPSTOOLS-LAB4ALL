@@ -1,0 +1,33 @@
+# Datadog Agent — Helm values for Kubernetes
+# Install: helm install datadog-agent datadog/datadog -n datadog -f kubernetes-values.yaml
+
+datadog:
+  apiKeyExistingSecret: datadog-secret   # kubectl create secret generic datadog-secret ...
+  appKeyExistingSecret: datadog-secret
+  site: datadoghq.com
+
+  tags:
+    - "env:production"
+    - "cluster:quantum-prod"
+    - "team:platform"
+
+  logs:
+    enabled: true
+    containerCollectAll: true
+
+  apm:
+    portEnabled: true
+
+  processAgent:
+    enabled: true
+    processCollection: true
+
+  kubeStateMetricsEnabled: true
+
+agents:
+  tolerations:
+    - operator: Exists   # run on all nodes, including tainted ones
+
+clusterAgent:
+  enabled: true
+  replicas: 2            # HA — always run 2 cluster agent replicas in production
